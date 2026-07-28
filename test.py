@@ -21,6 +21,17 @@ DATALAB_PIPELINE_ID = os.getenv("DATALAB_PIPELINE_ID", "pl_4AHLbwoxranz")
 DATALAB_PIPELINE_VERSION = os.getenv("DATALAB_PIPELINE_VERSION")
 DATALAB_POLL_INTERVAL_SECONDS = int(os.getenv("DATALAB_POLL_INTERVAL_SECONDS", "2"))
 DATALAB_TIMEOUT_SECONDS = int(os.getenv("DATALAB_TIMEOUT_SECONDS", "900"))
+SCAM_CENSUS_COLUMNS = [
+    "Chamber",
+    "Column",
+    "Row",
+    "Species",
+    "Count",
+    "Total_Height",
+    "Green_Height",
+    "Width_mm",
+    "Flower",
+]
 
 
 def chandra_convert(pdf_path):
@@ -386,10 +397,13 @@ def html_to_dataframes_and_bboxes(html):
 
     cleaned = []
     bbox_rows = []
+    accepted_table_index = 0
 
     for index, table_element in enumerate(table_elements, start=1):
+        if not looks_like_scam_census_table_element(table_element):
+            continue
+
         print("Processing table", index)
-        bbox_rows.extend(extract_table_cell_bboxes(table_element, index))
 
         try:
             table = pd.read_html(
@@ -412,8 +426,14 @@ def html_to_dataframes_and_bboxes(html):
         table = clean_headers(table)
         table = make_unique_columns(table)
 
-        if is_data_table(table):
-            cleaned.append(table)
+        if not is_scam_census_table(table):
+            continue
+
+        accepted_table_index += 1
+        cleaned.append(select_scam_census_columns(table))
+        bbox_rows.extend(
+            extract_table_cell_bboxes(table_element, accepted_table_index)
+        )
 
     if not cleaned:
         raise RuntimeError(
@@ -470,6 +490,21 @@ def extract_table_cell_bboxes(table_element, table_index):
     return rows
 
 
+def looks_like_scam_census_table_element(table_element):
+    text = _normalize_header(table_element.get_text(" ", strip=True)).lower()
+    required_words = (
+        "ch",
+        "species",
+        "count",
+        "width",
+        "flower",
+    )
+
+    has_height_columns = "height" in text or ("total" in text and "green" in text)
+
+    return all(word in text for word in required_words) and has_height_columns
+
+
 def flatten_headers(df):
     if not isinstance(df.columns, pd.MultiIndex):
         return df
@@ -522,6 +557,17 @@ def clean_headers(df):
     }
 
     return df.rename(columns=rename)
+
+
+def is_scam_census_table(df):
+    return all(
+        column in df.columns
+        for column in SCAM_CENSUS_COLUMNS
+    )
+
+
+def select_scam_census_columns(df):
+    return df[SCAM_CENSUS_COLUMNS].copy()
 
 
 def _normalize_header(value):
