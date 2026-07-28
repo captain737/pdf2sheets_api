@@ -204,10 +204,20 @@ def _extract_dataframes_from_pipeline_result(pipeline_result):
 
 
 def _extract_dataframes_from_value(value):
-    html = _find_first_rendered_text(value)
+    rendered_texts = []
+    _collect_rendered_texts(value, rendered_texts)
 
-    if html:
-        return html_to_dataframes(html)
+    if rendered_texts:
+        dataframes = []
+
+        for rendered_text in _dedupe_values(rendered_texts):
+            try:
+                dataframes.extend(html_to_dataframes(rendered_text))
+            except RuntimeError as error:
+                print("Skipping rendered text chunk:", error)
+
+        if dataframes:
+            return dataframes
 
     table_values = []
     _collect_table_like_values(value, table_values)
@@ -223,39 +233,31 @@ def _extract_dataframes_from_value(value):
     return dataframes
 
 
-def _find_first_rendered_text(value):
+def _collect_rendered_texts(value, rendered_texts):
     if isinstance(value, str):
         stripped = value.strip()
 
         if _looks_like_html_or_page_text(stripped):
-            return stripped
+            rendered_texts.append(stripped)
+            return
 
         try:
-            return _find_first_rendered_text(json.loads(stripped))
+            _collect_rendered_texts(json.loads(stripped), rendered_texts)
         except json.JSONDecodeError:
-            return None
+            return
 
-    if isinstance(value, dict):
+    elif isinstance(value, dict):
         for key in ("html", "markdown", "content", "output", "result", "text"):
-            rendered_text = _find_first_rendered_text(value.get(key))
+            if key in value:
+                _collect_rendered_texts(value[key], rendered_texts)
 
-            if rendered_text:
-                return rendered_text
+        for key, nested_value in value.items():
+            if key not in ("html", "markdown", "content", "output", "result", "text"):
+                _collect_rendered_texts(nested_value, rendered_texts)
 
-        for nested_value in value.values():
-            rendered_text = _find_first_rendered_text(nested_value)
-
-            if rendered_text:
-                return rendered_text
-
-    if isinstance(value, list):
+    elif isinstance(value, list):
         for item in value:
-            rendered_text = _find_first_rendered_text(item)
-
-            if rendered_text:
-                return rendered_text
-
-    return None
+            _collect_rendered_texts(item, rendered_texts)
 
 
 def _looks_like_html_or_page_text(value):
@@ -287,6 +289,20 @@ def _collect_table_like_values(value, table_values):
     elif isinstance(value, dict):
         for nested_value in value.values():
             _collect_table_like_values(nested_value, table_values)
+
+
+def _dedupe_values(values):
+    seen = set()
+    deduped = []
+
+    for value in values:
+        if value in seen:
+            continue
+
+        seen.add(value)
+        deduped.append(value)
+
+    return deduped
 
 
 def _value_to_dataframe(value):
@@ -367,11 +383,12 @@ def _page_sections_to_dataframes(text):
 
 
 def _parse_page_marker_rows(text):
-    lines = [
+    raw_lines = [
         line.strip()
         for line in _normalize_text(text).splitlines()
         if line.strip()
     ]
+    lines = _join_split_field_value_lines(raw_lines)
     page_rows = []
     pending_header_rows = []
     current_rows = None
@@ -415,6 +432,24 @@ def _parse_page_marker_rows(text):
         page_rows.append(current_rows)
 
     return page_rows
+
+
+def _join_split_field_value_lines(lines):
+    joined_lines = []
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+
+        if line.endswith(":") and index + 1 < len(lines):
+            joined_lines.append(f"{line} {lines[index + 1]}")
+            index += 2
+            continue
+
+        joined_lines.append(line)
+        index += 1
+
+    return joined_lines
 
 
 def _parse_field_value_line(line):
