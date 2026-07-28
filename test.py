@@ -187,40 +187,23 @@ def _fetch_pipeline_step_results(execution, headers):
 
 
 def pipeline_result_to_excel(pipeline_result, output_dir, output_filename="converted.xlsx"):
-    dataframes, bbox_df = _extract_dataframes_and_bboxes_from_pipeline_result(
-        pipeline_result
-    )
-    return dataframes_to_excel(dataframes, output_dir, output_filename, bbox_df=bbox_df)
+    dataframes = _extract_dataframes_from_pipeline_result(pipeline_result)
+    return dataframes_to_excel(dataframes, output_dir, output_filename)
 
 
 def _extract_dataframes_from_pipeline_result(pipeline_result):
-    dataframes, _bbox_df = _extract_dataframes_and_bboxes_from_pipeline_result(
-        pipeline_result
-    )
-    return dataframes
-
-
-def _extract_dataframes_and_bboxes_from_pipeline_result(pipeline_result):
     step_results = pipeline_result.get("step_results") or []
     all_dataframes = []
-    bbox_dataframes = []
 
     for step_result in step_results:
-        dataframes, bbox_df = _extract_dataframes_and_bboxes_from_value(
-            step_result.get("result")
-        )
+        dataframes = _extract_dataframes_from_value(step_result.get("result"))
 
         all_dataframes.extend(dataframes)
 
-        if not bbox_df.empty:
-            bbox_dataframes.append(bbox_df)
-
     if all_dataframes:
-        return all_dataframes, _combine_bbox_dataframes(bbox_dataframes)
+        return all_dataframes
 
-    all_dataframes, bbox_df = _extract_dataframes_and_bboxes_from_value(
-        pipeline_result
-    )
+    all_dataframes = _extract_dataframes_from_value(pipeline_result)
 
     if not all_dataframes:
         raise RuntimeError(
@@ -228,34 +211,24 @@ def _extract_dataframes_and_bboxes_from_pipeline_result(pipeline_result):
             "were found in the step results."
         )
 
-    return all_dataframes, bbox_df
+    return all_dataframes
 
 
 def _extract_dataframes_from_value(value):
-    dataframes, _bbox_df = _extract_dataframes_and_bboxes_from_value(value)
-    return dataframes
-
-
-def _extract_dataframes_and_bboxes_from_value(value):
     rendered_texts = []
     _collect_rendered_texts(value, rendered_texts)
-    bbox_dataframes = []
 
     if rendered_texts:
         dataframes = []
 
         for rendered_text in _dedupe_values(rendered_texts):
             try:
-                chunk_dataframes, bbox_df = html_to_dataframes_and_bboxes(rendered_text)
-                dataframes.extend(chunk_dataframes)
-
-                if not bbox_df.empty:
-                    bbox_dataframes.append(bbox_df)
+                dataframes.extend(html_to_dataframes(rendered_text))
             except RuntimeError as error:
                 print("Skipping rendered text chunk:", error)
 
         if dataframes:
-            return dataframes, _combine_bbox_dataframes(bbox_dataframes)
+            return dataframes
 
     table_values = []
     _collect_table_like_values(value, table_values)
@@ -268,18 +241,7 @@ def _extract_dataframes_and_bboxes_from_value(value):
         if df is not None and df.shape[0] >= 1 and df.shape[1] >= 1:
             dataframes.append(_clean_dataframe(df))
 
-    return dataframes, pd.DataFrame()
-
-
-def _combine_bbox_dataframes(bbox_dataframes):
-    if not bbox_dataframes:
-        return pd.DataFrame()
-
-    return pd.concat(
-        bbox_dataframes,
-        ignore_index=True,
-        sort=False,
-    )
+    return dataframes
 
 
 def _collect_rendered_texts(value, rendered_texts):
@@ -375,16 +337,11 @@ def _value_to_dataframe(value):
 
 
 def html_to_excel(html, output_dir, output_filename="converted.xlsx"):
-    dataframes, bbox_df = html_to_dataframes_and_bboxes(html)
-    return dataframes_to_excel(dataframes, output_dir, output_filename, bbox_df=bbox_df)
+    dataframes = html_to_dataframes(html)
+    return dataframes_to_excel(dataframes, output_dir, output_filename)
 
 
 def html_to_dataframes(html):
-    dataframes, _bbox_df = html_to_dataframes_and_bboxes(html)
-    return dataframes
-
-
-def html_to_dataframes_and_bboxes(html):
     print("Reading botanical HTML tables...")
 
     soup = BeautifulSoup(
@@ -396,8 +353,6 @@ def html_to_dataframes_and_bboxes(html):
     print("Tables found:", len(table_elements))
 
     cleaned = []
-    bbox_rows = []
-    accepted_table_index = 0
 
     for index, table_element in enumerate(table_elements, start=1):
         if not looks_like_scam_census_table_element(table_element):
@@ -429,65 +384,14 @@ def html_to_dataframes_and_bboxes(html):
         if not is_scam_census_table(table):
             continue
 
-        accepted_table_index += 1
         cleaned.append(select_scam_census_columns(table))
-        bbox_rows.extend(
-            extract_table_cell_bboxes(table_element, accepted_table_index)
-        )
 
     if not cleaned:
         raise RuntimeError(
             "No usable botanical tables found."
         )
 
-    bbox_df = pd.DataFrame(
-        bbox_rows,
-        columns=[
-            "table_index",
-            "row_index",
-            "col_index",
-            "cell_type",
-            "rowspan",
-            "colspan",
-            "text",
-            "bbox",
-            "confidence",
-        ],
-    )
-
-    return cleaned, bbox_df
-
-
-def extract_table_cell_bboxes(table_element, table_index):
-    rows = []
-
-    for row_index, row in enumerate(table_element.find_all("tr"), start=1):
-        col_index = 1
-
-        for cell in row.find_all(["th", "td"]):
-            bbox = cell.get("data-bbox")
-
-            if not bbox:
-                col_index += int(cell.get("colspan", "1"))
-                continue
-
-            rows.append(
-                {
-                    "table_index": table_index,
-                    "row_index": row_index,
-                    "col_index": col_index,
-                    "cell_type": cell.name,
-                    "rowspan": cell.get("rowspan", "1"),
-                    "colspan": cell.get("colspan", "1"),
-                    "text": _normalize_text(cell.get_text(" ", strip=True)),
-                    "bbox": bbox,
-                    "confidence": cell.get("data-confidence"),
-                }
-            )
-
-            col_index += int(cell.get("colspan", "1"))
-
-    return rows
+    return cleaned
 
 
 def looks_like_scam_census_table_element(table_element):
@@ -567,7 +471,24 @@ def is_scam_census_table(df):
 
 
 def select_scam_census_columns(df):
-    return df[SCAM_CENSUS_COLUMNS].copy()
+    df = df[SCAM_CENSUS_COLUMNS].copy()
+
+    for column in ("Chamber", "Column", "Count", "Total_Height", "Green_Height", "Width_mm"):
+        df[column] = df[column].map(_prefer_latter_ocr_candidate)
+
+    return df
+
+
+def _prefer_latter_ocr_candidate(value):
+    if pd.isna(value):
+        return value
+
+    text = str(value).strip()
+
+    if not re.fullmatch(r"\d+(?:\.\d+)?\s+\d+(?:\.\d+)?", text):
+        return value
+
+    return text.split()[-1]
 
 
 def _normalize_header(value):
