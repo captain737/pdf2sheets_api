@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+from difflib import SequenceMatcher
 from io import StringIO
 from pathlib import Path
 
@@ -33,6 +34,58 @@ SCAM_CENSUS_COLUMNS = [
     "Width_mm",
     "Flower",
 ]
+FUZZY_HEADER_TARGETS = {
+    "Chamber": (
+        "ch",
+        "chamber",
+    ),
+    "Column": (
+        "col",
+        "column",
+        "col see map",
+        "subplot",
+        "subplot #",
+        "subplot number",
+    ),
+    "Row": (
+        "row",
+        "subplot code",
+        "sub code",
+        "sub sub code",
+        "row code",
+    ),
+    "Species": (
+        "species",
+        "species see list",
+    ),
+    "Count": (
+        "count",
+        "consec number",
+        "consecutive number",
+        "number",
+    ),
+    "Total_Height": (
+        "height total cm",
+        "total height",
+        "total cm",
+    ),
+    "Green_Height": (
+        "height green cm",
+        "green height",
+        "green cm",
+    ),
+    "Width_mm": (
+        "width mm",
+        "height width mm",
+        "width",
+    ),
+    "Flower": (
+        "flower",
+        "flower y n c",
+        "flower ync",
+    ),
+}
+FUZZY_HEADER_MIN_SCORE = 0.78
 
 
 def chandra_convert(pdf_path):
@@ -497,7 +550,49 @@ def clean_headers(df):
         "Width": "Width_mm",
     }
 
-    return df.rename(columns=rename)
+    df = df.rename(columns=rename)
+    df.columns = [
+        fuzzy_match_header(column)
+        for column in df.columns
+    ]
+
+    return df
+
+
+def fuzzy_match_header(column):
+    column = _normalize_header(column)
+
+    if column in SCAM_CENSUS_COLUMNS:
+        return column
+
+    normalized_column = _normalize_header_for_match(column)
+    best_target = column
+    best_score = 0
+
+    for target, candidates in FUZZY_HEADER_TARGETS.items():
+        for candidate in candidates:
+            score = SequenceMatcher(
+                None,
+                normalized_column,
+                _normalize_header_for_match(candidate),
+            ).ratio()
+
+            if score > best_score:
+                best_target = target
+                best_score = score
+
+    if best_score >= FUZZY_HEADER_MIN_SCORE:
+        return best_target
+
+    return column
+
+
+def _normalize_header_for_match(value):
+    return re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        str(value).lower(),
+    ).strip()
 
 
 def expand_embedded_header_values(df):
