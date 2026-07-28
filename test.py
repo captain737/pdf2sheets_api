@@ -308,13 +308,22 @@ def _dedupe_values(values):
     deduped = []
 
     for value in values:
-        if value in seen:
+        key = _dedupe_key(value)
+
+        if key in seen:
             continue
 
-        seen.add(value)
+        seen.add(key)
         deduped.append(value)
 
     return deduped
+
+
+def _dedupe_key(value):
+    if isinstance(value, str):
+        return value
+
+    return repr(value)
 
 
 def _value_to_dataframe(value):
@@ -567,7 +576,7 @@ def _dedupe_adjacent(values):
     deduped = []
 
     for value in values:
-        if deduped and deduped[-1] == value:
+        if deduped and _dedupe_key(deduped[-1]) == _dedupe_key(value):
             continue
 
         deduped.append(value)
@@ -789,7 +798,10 @@ def _clean_dataframe(df):
 
 
 def _clean_cell(value):
-    if pd.isna(value):
+    if value is None:
+        return value
+
+    if isinstance(value, float) and pd.isna(value):
         return value
 
     return (
