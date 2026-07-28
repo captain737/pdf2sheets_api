@@ -9,6 +9,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from openpyxl.styles import Alignment
 
 
 load_dotenv()
@@ -676,7 +677,7 @@ def _strip_markdown_emphasis(value):
     return re.sub(r"\*\*(.*?)\*\*", r"\1", value).strip()
 
 
-def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx", bbox_df=None):
+def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx"):
     output_dir = Path(output_dir)
     output_dir.mkdir(
         parents=True,
@@ -698,14 +699,12 @@ def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx"
             index=False,
             sheet_name="Data",
         )
+        worksheet = writer.sheets["Data"]
+        right_alignment = Alignment(horizontal="right")
 
-        if bbox_df is not None and not bbox_df.empty:
-            bbox_df.to_excel(
-                writer,
-                index=False,
-                sheet_name="Cell_BBoxes",
-            )
-            print(f"Saved {len(bbox_df)} bbox cells")
+        for row in worksheet.iter_rows():
+            for cell in row:
+                cell.alignment = right_alignment
 
     print("Saved:", output_file)
 
