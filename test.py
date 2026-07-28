@@ -1,0 +1,410 @@
+import json
+import os
+import time
+from io import StringIO
+from pathlib import Path
+
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+DATALAB_API_BASE_URL = os.getenv(
+    "DATALAB_API_BASE_URL",
+    "https://www.datalab.to/api/v1",
+).rstrip("/")
+DATALAB_PIPELINE_ID = os.getenv("DATALAB_PIPELINE_ID", "pl_4AHLbwoxranz")
+DATALAB_PIPELINE_VERSION = os.getenv("DATALAB_PIPELINE_VERSION")
+DATALAB_POLL_INTERVAL_SECONDS = int(os.getenv("DATALAB_POLL_INTERVAL_SECONDS", "2"))
+DATALAB_TIMEOUT_SECONDS = int(os.getenv("DATALAB_TIMEOUT_SECONDS", "900"))
+
+
+def chandra_convert(pdf_path):
+    """
+    Run the configured Datalab Chandra OCR pipeline and return its step results.
+    """
+
+    return run_chandra_pipeline(pdf_path)
+
+
+def run_chandra_pipeline(pdf_path, pipeline_id=None):
+    api_key = os.getenv("DATALAB_API_KEY")
+
+    if not api_key:
+        raise RuntimeError(
+            "DATALAB_API_KEY missing. Add it to .env or export it in terminal."
+        )
+
+    pipeline_id = pipeline_id or DATALAB_PIPELINE_ID
+    pdf_path = Path(pdf_path)
+    headers = {
+        "X-API-Key": api_key,
+    }
+
+    data = {}
+
+    if DATALAB_PIPELINE_VERSION:
+        data["version"] = DATALAB_PIPELINE_VERSION
+
+    print(f"Running Datalab Chandra OCR pipeline: {pipeline_id}")
+
+    with open(pdf_path, "rb") as file_handle:
+        response = requests.post(
+            f"{DATALAB_API_BASE_URL}/pipelines/{pipeline_id}/run",
+            headers=headers,
+            files={
+                "file": (
+                    pdf_path.name,
+                    file_handle,
+                    "application/pdf",
+                )
+            },
+            data=data,
+            timeout=60,
+        )
+
+    print("Datalab pipeline submit status:", response.status_code)
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Datalab pipeline submit failed "
+            f"({response.status_code}): {response.text}"
+        )
+
+    submission = response.json()
+    execution_id = submission.get("execution_id")
+
+    if not execution_id:
+        raise RuntimeError(
+            f"Datalab pipeline response did not include execution_id: {submission}"
+        )
+
+    execution = _poll_pipeline_execution(execution_id, headers)
+    step_results = _fetch_pipeline_step_results(execution, headers)
+
+    return {
+        "execution": execution,
+        "step_results": step_results,
+    }
+
+
+def _poll_pipeline_execution(execution_id, headers):
+    deadline = time.monotonic() + DATALAB_TIMEOUT_SECONDS
+
+    while time.monotonic() < deadline:
+        response = requests.get(
+            f"{DATALAB_API_BASE_URL}/pipelines/executions/{execution_id}",
+            headers=headers,
+            timeout=60,
+        )
+
+        if not response.ok:
+            raise RuntimeError(
+                f"Datalab pipeline poll failed "
+                f"({response.status_code}): {response.text}"
+            )
+
+        execution = response.json()
+        status = execution.get("status")
+
+        print("Datalab pipeline status:", status)
+
+        if status in ("completed", "completed_with_errors"):
+            return execution
+
+        if status == "failed":
+            raise RuntimeError(
+                f"Datalab pipeline failed: {execution}"
+            )
+
+        time.sleep(DATALAB_POLL_INTERVAL_SECONDS)
+
+    raise TimeoutError(
+        "Timed out waiting for Datalab pipeline execution to finish."
+    )
+
+
+def _fetch_pipeline_step_results(execution, headers):
+    execution_id = execution.get("execution_id")
+    steps = execution.get("steps") or []
+    results = []
+
+    for fallback_index, step in enumerate(steps):
+        if step.get("status") != "completed":
+            continue
+
+        step_index = (
+            step.get("step_index")
+            or step.get("index")
+            or fallback_index
+        )
+
+        response = requests.get(
+            (
+                f"{DATALAB_API_BASE_URL}/pipelines/executions/"
+                f"{execution_id}/steps/{step_index}/result"
+            ),
+            headers=headers,
+            timeout=60,
+        )
+
+        if not response.ok:
+            print(
+                f"Skipping step {step_index} result:",
+                response.status_code,
+                response.text,
+            )
+            continue
+
+        results.append(
+            {
+                "step": step,
+                "result": response.json(),
+            }
+        )
+
+    if not results:
+        raise RuntimeError(
+            f"No completed pipeline step results found: {execution}"
+        )
+
+    return results
+
+
+def pipeline_result_to_excel(pipeline_result, output_dir, output_filename="converted.xlsx"):
+    dataframes = _extract_dataframes_from_pipeline_result(pipeline_result)
+    return dataframes_to_excel(dataframes, output_dir, output_filename)
+
+
+def _extract_dataframes_from_pipeline_result(pipeline_result):
+    step_results = pipeline_result.get("step_results") or []
+
+    for step_result in reversed(step_results):
+        dataframes = _extract_dataframes_from_value(step_result.get("result"))
+
+        if dataframes:
+            return dataframes
+
+    dataframes = _extract_dataframes_from_value(pipeline_result)
+
+    if dataframes:
+        return dataframes
+
+    raise RuntimeError(
+        "Pipeline completed, but no HTML tables or structured table-like JSON "
+        "were found in the step results."
+    )
+
+
+def _extract_dataframes_from_value(value):
+    html = _find_first_html(value)
+
+    if html:
+        return html_to_dataframes(html)
+
+    table_values = []
+    _collect_table_like_values(value, table_values)
+
+    dataframes = []
+
+    for table_value in table_values:
+        df = _value_to_dataframe(table_value)
+
+        if df is not None and df.shape[0] >= 1 and df.shape[1] >= 1:
+            dataframes.append(_clean_dataframe(df))
+
+    return dataframes
+
+
+def _find_first_html(value):
+    if isinstance(value, str):
+        stripped = value.strip()
+
+        if "<table" in stripped.lower():
+            return stripped
+
+        try:
+            return _find_first_html(json.loads(stripped))
+        except json.JSONDecodeError:
+            return None
+
+    if isinstance(value, dict):
+        for key in ("html", "content", "output", "result"):
+            html = _find_first_html(value.get(key))
+
+            if html:
+                return html
+
+        for nested_value in value.values():
+            html = _find_first_html(nested_value)
+
+            if html:
+                return html
+
+    if isinstance(value, list):
+        for item in value:
+            html = _find_first_html(item)
+
+            if html:
+                return html
+
+    return None
+
+
+def _collect_table_like_values(value, table_values):
+    if isinstance(value, str):
+        try:
+            _collect_table_like_values(json.loads(value), table_values)
+        except json.JSONDecodeError:
+            return
+
+    elif isinstance(value, list):
+        if value and all(isinstance(item, dict) for item in value):
+            table_values.append(value)
+            return
+
+        for item in value:
+            _collect_table_like_values(item, table_values)
+
+    elif isinstance(value, dict):
+        for nested_value in value.values():
+            _collect_table_like_values(nested_value, table_values)
+
+
+def _value_to_dataframe(value):
+    if isinstance(value, list):
+        if not value:
+            return None
+
+        if all(isinstance(item, dict) for item in value):
+            return pd.json_normalize(value)
+
+        if all(isinstance(item, list) for item in value):
+            return pd.DataFrame(value)
+
+    if isinstance(value, dict):
+        if all(not isinstance(item, (dict, list)) for item in value.values()):
+            return pd.DataFrame([value])
+
+        return pd.json_normalize(value)
+
+    return None
+
+
+def html_to_excel(html, output_dir, output_filename="converted.xlsx"):
+    dataframes = html_to_dataframes(html)
+    return dataframes_to_excel(dataframes, output_dir, output_filename)
+
+
+def html_to_dataframes(html):
+    print("Extracting HTML tables...")
+
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
+    )
+
+    tables = soup.find_all("table")
+
+    print(f"Found {len(tables)} tables")
+
+    if not tables:
+        raise RuntimeError(
+            "No tables found in OCR output."
+        )
+
+    dataframes = []
+
+    for index, table in enumerate(tables, start=1):
+        try:
+            df = pd.read_html(StringIO(str(table)))[0]
+            df = _clean_dataframe(df)
+
+            if df.shape[0] < 1 or df.shape[1] < 2:
+                print(f"Skipping small/non-tabular table {index}: {df.shape}")
+                continue
+
+            dataframes.append(df)
+        except Exception as error:
+            print("Skipping table:", error)
+
+    if not dataframes:
+        raise RuntimeError(
+            "Could not parse any usable tables from OCR output."
+        )
+
+    return dataframes
+
+
+def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx"):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    output_file = output_dir / output_filename
+
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        if len(dataframes) == 1:
+            dataframes[0].to_excel(writer, sheet_name="Extracted", index=False)
+            print("Saved:", output_file)
+            return str(output_file)
+
+        combined_df = pd.concat(
+            dataframes,
+            ignore_index=True,
+            sort=False,
+        )
+        combined_df.to_excel(writer, sheet_name="Combined", index=False)
+
+        for index, df in enumerate(dataframes, start=1):
+            df.to_excel(
+                writer,
+                sheet_name=f"Table {index}"[:31],
+                index=False,
+            )
+
+    print("Saved:", output_file)
+
+    return str(output_file)
+
+
+def _clean_dataframe(df):
+    df = df.copy()
+
+    df.columns = [
+        _clean_cell(column)
+        for column in df.columns
+    ]
+
+    df = df.map(_clean_cell)
+    df = df.dropna(how="all")
+    df = df.dropna(axis=1, how="all")
+
+    return df
+
+
+def _clean_cell(value):
+    if pd.isna(value):
+        return value
+
+    return (
+        str(value)
+        .replace("\xa0", " ")
+        .replace("\n", " ")
+        .strip()
+    )
+
+
+def convert_pdf_to_excel(pdf_path, output_dir, output_filename="converted.xlsx"):
+    pipeline_result = chandra_convert(pdf_path)
+
+    return pipeline_result_to_excel(
+        pipeline_result,
+        output_dir,
+        output_filename=output_filename,
+    )

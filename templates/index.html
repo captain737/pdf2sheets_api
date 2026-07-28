@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PDF to Excel</title>
+</head>
+
+<body>
+
+<h1>Convert PDF to Excel</h1>
+
+<form action="/convert" method="post" enctype="multipart/form-data">
+
+    <input 
+        type="file" 
+        name="file"
+        accept=".pdf"
+        required
+    >
+
+    <button type="submit">
+        Convert
+    </button>
+
+</form>
+
+</body>
+</html>

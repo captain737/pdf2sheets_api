@@ -1,0 +1,27 @@
+# Web server
+fastapi
+uvicorn[standard]
+
+# Templates / frontend
+jinja2
+
+# File uploads
+python-multipart
+
+# Data processing
+pandas
+numpy
+
+# Excel output
+openpyxl
+
+# HTML table parsing
+beautifulsoup4
+lxml
+
+# API calls
+requests
+python-dotenv
+
+# Optional: better async support
+httpx
