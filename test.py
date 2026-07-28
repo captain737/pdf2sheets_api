@@ -331,43 +331,168 @@ def html_to_excel(html, output_dir, output_filename="converted.xlsx"):
 
 
 def html_to_dataframes(html):
-    print("Extracting page sections and HTML tables...")
+    print("Reading botanical HTML tables...")
 
     soup = BeautifulSoup(
         html,
         "html.parser",
     )
+    table_elements = soup.find_all("table")
 
-    tables = soup.find_all("table")
+    print("Tables found:", len(table_elements))
 
-    dataframes = []
-    page_dataframes = _page_sections_to_dataframes(soup.get_text("\n"))
+    cleaned = []
 
-    if page_dataframes:
-        print(f"Found {len(page_dataframes)} page sections")
-        dataframes.extend(page_dataframes)
+    for index, table_element in enumerate(table_elements, start=1):
+        print("Processing table", index)
 
-    print(f"Found {len(tables)} HTML tables")
-
-    for index, table in enumerate(tables, start=1):
         try:
-            df = pd.read_html(StringIO(str(table)))[0]
-            df = _clean_dataframe(df)
-
-            if df.shape[0] < 1 or df.shape[1] < 2:
-                print(f"Skipping small/non-tabular table {index}: {df.shape}")
+            table = pd.read_html(
+                StringIO(str(table_element)),
+                header=[0, 1],
+            )[0]
+        except ValueError:
+            try:
+                table = pd.read_html(
+                    StringIO(str(table_element)),
+                    header=0,
+                )[0]
+            except ValueError as error:
+                print("Skipping table:", error)
                 continue
 
-            dataframes.append(df)
-        except Exception as error:
-            print("Skipping table:", error)
+        table = flatten_headers(table)
+        print("Headers:", table.columns.tolist())
 
-    if not dataframes:
+        table = clean_headers(table)
+        table = make_unique_columns(table)
+
+        if is_data_table(table):
+            cleaned.append(table)
+
+    if not cleaned:
         raise RuntimeError(
-            "Could not parse any page sections or usable tables from OCR output."
+            "No usable botanical tables found."
         )
 
-    return dataframes
+    return cleaned
+
+
+def flatten_headers(df):
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df
+
+    new_columns = []
+
+    for column in df.columns:
+        parts = []
+
+        for item in column:
+            item = str(item).strip()
+
+            if item != "nan" and not item.startswith("Unnamed"):
+                parts.append(item)
+
+        new_columns.append(" ".join(_dedupe_adjacent(parts)))
+
+    df.columns = new_columns
+
+    return df
+
+
+def clean_headers(df):
+    df.columns = [
+        _normalize_header(column)
+        for column in df.columns
+    ]
+
+    rename = {
+        "Subplot COL #": "Subplot",
+        "Subplot Row Code": "Row_Code",
+        "Consec Number 1, 2, 3... per quad": "Consec_Number",
+        "Height (cm) (cm)": "Height_cm",
+        "Width (mm) (only if > 200 cm)": "Width_mm",
+        "Flower Y/N/C": "Flower",
+        "Herbivory G/L/A/N": "Herbivory",
+        "CEVO Flag #": "CEVO_Flag",
+        "CH": "Chamber",
+        "Col": "Column",
+        "Col (see map)": "Column",
+        "Row": "Row",
+        "Species": "Species",
+        "Count": "Count",
+        "Height Total (cm)": "Total_Height",
+        "Height Green (cm)": "Green_Height",
+        "Total (cm)": "Total_Height",
+        "Green (cm)": "Green_Height",
+        "Width (mm)": "Width_mm",
+        "Width": "Width_mm",
+    }
+
+    return df.rename(columns=rename)
+
+
+def _normalize_header(value):
+    value = str(value).strip()
+    value = re.sub(r"\s+", " ", value)
+    value = value.replace(" (", " (")
+
+    return value
+
+
+def make_unique_columns(df):
+    seen = {}
+    columns = []
+
+    for column in df.columns:
+        column = str(column)
+
+        if column not in seen:
+            seen[column] = 0
+            columns.append(column)
+            continue
+
+        seen[column] += 1
+        columns.append(f"{column}_{seen[column]}")
+
+    df.columns = columns
+
+    return df
+
+
+def is_data_table(df):
+    columns = [
+        str(column).lower()
+        for column in df.columns
+    ]
+
+    keywords = [
+        "height",
+        "species",
+        "subplot",
+        "count",
+        "flower",
+        "width",
+    ]
+
+    matches = sum(
+        any(keyword in column for column in columns)
+        for keyword in keywords
+    )
+
+    return matches >= 2
+
+
+def _dedupe_adjacent(values):
+    deduped = []
+
+    for value in values:
+        if deduped and deduped[-1] == value:
+            continue
+
+        deduped.append(value)
+
+    return deduped
 
 
 def _page_sections_to_dataframes(text):
@@ -501,25 +626,18 @@ def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx"
 
     output_file = output_dir / output_filename
 
-    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-        if len(dataframes) == 1:
-            dataframes[0].to_excel(writer, sheet_name="Extracted", index=False)
-            print("Saved:", output_file)
-            return str(output_file)
+    final = pd.concat(
+        dataframes,
+        ignore_index=True,
+        sort=False,
+    )
 
-        combined_df = pd.concat(
-            dataframes,
-            ignore_index=True,
-            sort=False,
-        )
-        combined_df.to_excel(writer, sheet_name="Combined", index=False)
-
-        for index, df in enumerate(dataframes, start=1):
-            df.to_excel(
-                writer,
-                sheet_name=f"Table {index}"[:31],
-                index=False,
-            )
+    final.to_excel(
+        output_file,
+        index=False,
+        sheet_name="Data",
+        engine="openpyxl",
+    )
 
     print("Saved:", output_file)
 
