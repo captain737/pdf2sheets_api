@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from io import StringIO
 from pathlib import Path
@@ -181,26 +182,29 @@ def pipeline_result_to_excel(pipeline_result, output_dir, output_filename="conve
 
 def _extract_dataframes_from_pipeline_result(pipeline_result):
     step_results = pipeline_result.get("step_results") or []
+    all_dataframes = []
 
-    for step_result in reversed(step_results):
+    for step_result in step_results:
         dataframes = _extract_dataframes_from_value(step_result.get("result"))
 
-        if dataframes:
-            return dataframes
+        all_dataframes.extend(dataframes)
 
-    dataframes = _extract_dataframes_from_value(pipeline_result)
+    if all_dataframes:
+        return all_dataframes
 
-    if dataframes:
-        return dataframes
+    all_dataframes = _extract_dataframes_from_value(pipeline_result)
 
-    raise RuntimeError(
-        "Pipeline completed, but no HTML tables or structured table-like JSON "
-        "were found in the step results."
-    )
+    if not all_dataframes:
+        raise RuntimeError(
+            "Pipeline completed, but no HTML tables or structured table-like JSON "
+            "were found in the step results."
+        )
+
+    return all_dataframes
 
 
 def _extract_dataframes_from_value(value):
-    html = _find_first_html(value)
+    html = _find_first_rendered_text(value)
 
     if html:
         return html_to_dataframes(html)
@@ -219,39 +223,50 @@ def _extract_dataframes_from_value(value):
     return dataframes
 
 
-def _find_first_html(value):
+def _find_first_rendered_text(value):
     if isinstance(value, str):
         stripped = value.strip()
 
-        if "<table" in stripped.lower():
+        if _looks_like_html_or_page_text(stripped):
             return stripped
 
         try:
-            return _find_first_html(json.loads(stripped))
+            return _find_first_rendered_text(json.loads(stripped))
         except json.JSONDecodeError:
             return None
 
     if isinstance(value, dict):
-        for key in ("html", "content", "output", "result"):
-            html = _find_first_html(value.get(key))
+        for key in ("html", "markdown", "content", "output", "result", "text"):
+            rendered_text = _find_first_rendered_text(value.get(key))
 
-            if html:
-                return html
+            if rendered_text:
+                return rendered_text
 
         for nested_value in value.values():
-            html = _find_first_html(nested_value)
+            rendered_text = _find_first_rendered_text(nested_value)
 
-            if html:
-                return html
+            if rendered_text:
+                return rendered_text
 
     if isinstance(value, list):
         for item in value:
-            html = _find_first_html(item)
+            rendered_text = _find_first_rendered_text(item)
 
-            if html:
-                return html
+            if rendered_text:
+                return rendered_text
 
     return None
+
+
+def _looks_like_html_or_page_text(value):
+    lowered = value.lower()
+
+    return (
+        "<table" in lowered
+        or "<html" in lowered
+        or "<p" in lowered
+        or re.search(r"\bpage\s*:\s*\d+\s+of\s+\d+", value, re.IGNORECASE)
+    )
 
 
 def _collect_table_like_values(value, table_values):
@@ -300,7 +315,7 @@ def html_to_excel(html, output_dir, output_filename="converted.xlsx"):
 
 
 def html_to_dataframes(html):
-    print("Extracting HTML tables...")
+    print("Extracting page sections and HTML tables...")
 
     soup = BeautifulSoup(
         html,
@@ -309,14 +324,14 @@ def html_to_dataframes(html):
 
     tables = soup.find_all("table")
 
-    print(f"Found {len(tables)} tables")
-
-    if not tables:
-        raise RuntimeError(
-            "No tables found in OCR output."
-        )
-
     dataframes = []
+    page_dataframes = _page_sections_to_dataframes(soup.get_text("\n"))
+
+    if page_dataframes:
+        print(f"Found {len(page_dataframes)} page sections")
+        dataframes.extend(page_dataframes)
+
+    print(f"Found {len(tables)} HTML tables")
 
     for index, table in enumerate(tables, start=1):
         try:
@@ -333,10 +348,113 @@ def html_to_dataframes(html):
 
     if not dataframes:
         raise RuntimeError(
-            "Could not parse any usable tables from OCR output."
+            "Could not parse any page sections or usable tables from OCR output."
         )
 
     return dataframes
+
+
+def _page_sections_to_dataframes(text):
+    page_rows = _parse_page_marker_rows(text)
+
+    if not page_rows:
+        return []
+
+    return [
+        _clean_dataframe(pd.DataFrame(rows))
+        for rows in page_rows
+    ]
+
+
+def _parse_page_marker_rows(text):
+    lines = [
+        line.strip()
+        for line in _normalize_text(text).splitlines()
+        if line.strip()
+    ]
+    page_rows = []
+    pending_header_rows = []
+    current_rows = None
+    current_page = None
+
+    for line in lines:
+        cleaned_line = _strip_markdown_emphasis(line)
+        field_value = _parse_field_value_line(cleaned_line)
+
+        if not field_value:
+            continue
+
+        field, value = field_value
+        page_match = re.match(r"^(\d+)\s+of\s+\d+$", value, re.IGNORECASE)
+
+        if field.lower() == "page" and page_match:
+            if current_rows:
+                page_rows.append(current_rows)
+
+            current_page = int(page_match.group(1))
+            current_rows = [
+                _page_row(current_page, header_field, header_value)
+                for header_field, header_value in pending_header_rows
+            ]
+            current_rows.append(_page_row(current_page, field, value))
+            pending_header_rows = []
+            continue
+
+        if current_page is None:
+            pending_header_rows.append((field, value))
+            continue
+
+        if field.lower() in ("date", "chamber") and _looks_like_new_page_header(field, value):
+            pending_header_rows = [(field, value)]
+            current_page = None
+            continue
+
+        current_rows.append(_page_row(current_page, field, value))
+
+    if current_rows:
+        page_rows.append(current_rows)
+
+    return page_rows
+
+
+def _parse_field_value_line(line):
+    match = re.match(r"^([^:]{1,80})\s*:\s*(.+)$", line)
+
+    if not match:
+        return None
+
+    return (
+        match.group(1).strip(),
+        match.group(2).strip(),
+    )
+
+
+def _looks_like_new_page_header(field, value):
+    if field.lower() == "date":
+        return bool(re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", value))
+
+    return True
+
+
+def _page_row(page_number, field, value):
+    return {
+        "source_page": page_number,
+        "field": field,
+        "value": value,
+    }
+
+
+def _normalize_text(text):
+    return (
+        str(text)
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\xa0", " ")
+    )
+
+
+def _strip_markdown_emphasis(value):
+    return re.sub(r"\*\*(.*?)\*\*", r"\1", value).strip()
 
 
 def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx"):
