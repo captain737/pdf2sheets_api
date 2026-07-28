@@ -498,7 +498,10 @@ def select_scam_census_columns(df):
 
 
 def _prefer_latter_ocr_candidate(value):
-    if pd.isna(value):
+    if value is None:
+        return value
+
+    if isinstance(value, float) and pd.isna(value):
         return value
 
     text = str(value).strip()
