@@ -356,7 +356,7 @@ def html_to_dataframes(html):
     cleaned = []
 
     for index, table_element in enumerate(table_elements, start=1):
-        if not looks_like_scam_census_table_element(table_element):
+        if not looks_like_botanical_data_table_element(table_element):
             continue
 
         print("Processing table", index)
@@ -395,15 +395,36 @@ def html_to_dataframes(html):
     return cleaned
 
 
-def looks_like_scam_census_table_element(table_element):
+def looks_like_botanical_data_table_element(table_element):
     text = _normalize_header(table_element.get_text(" ", strip=True)).lower()
-    required_words = (
+    rows = table_element.find_all("tr")
+
+    if len(rows) < 4:
+        return False
+
+    signals = (
         "ch",
         "species",
         "count",
+        "sub",
+        "subplot",
+        "code",
+        "consec",
+        "number",
+        "plot",
+        "quadrant",
+        "quad",
+        "height",
+        "width",
+        "flower",
+    )
+    matches = sum(
+        1
+        for signal in signals
+        if re.search(rf"\b{re.escape(signal)}\b", text)
     )
 
-    return all(word in text for word in required_words)
+    return matches >= 3
 
 
 def flatten_headers(df):
