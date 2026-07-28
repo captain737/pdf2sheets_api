@@ -631,6 +631,7 @@ def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx"
         ignore_index=True,
         sort=False,
     )
+    final = remove_crossed_out_rows(final)
 
     final.to_excel(
         output_file,
@@ -642,6 +643,48 @@ def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx"
     print("Saved:", output_file)
 
     return str(output_file)
+
+
+def remove_crossed_out_rows(df):
+    df = df.copy()
+    text_df = df.astype(str).apply(lambda column: column.str.strip())
+    lowered_df = text_df.apply(lambda column: column.str.lower())
+
+    crossed_out_text = lowered_df.apply(
+        lambda row: row.str.contains("crossed out", na=False).any(),
+        axis=1,
+    )
+    large_x_rows = _large_x_placeholder_rows(lowered_df)
+    rows_to_drop = crossed_out_text | large_x_rows
+
+    dropped = int(rows_to_drop.sum())
+
+    if dropped:
+        print(f"Dropped {dropped} crossed-out/X placeholder rows")
+
+    return df.loc[~rows_to_drop].reset_index(drop=True)
+
+
+def _large_x_placeholder_rows(lowered_df):
+    measurement_columns = [
+        column
+        for column in ("Total_Height", "Green_Height", "Width_mm", "Flower")
+        if column in lowered_df.columns
+    ]
+
+    if measurement_columns:
+        return lowered_df[measurement_columns].eq("x").all(axis=1)
+
+    non_identity_columns = [
+        column
+        for column in lowered_df.columns
+        if column not in ("Chamber", "Column", "Row", "Species", "Count")
+    ]
+
+    if not non_identity_columns:
+        return pd.Series(False, index=lowered_df.index)
+
+    return lowered_df[non_identity_columns].eq("x").all(axis=1)
 
 
 def _clean_dataframe(df):
