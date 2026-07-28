@@ -369,32 +369,32 @@ def html_to_dataframes(html):
             continue
 
         print("Processing table", index)
+        accepted_table = None
 
-        try:
-            table = pd.read_html(
-                StringIO(str(table_element)),
-                header=[0, 1],
-            )[0]
-        except ValueError:
+        for header in ([0, 1], 0):
             try:
                 table = pd.read_html(
                     StringIO(str(table_element)),
-                    header=0,
+                    header=header,
                 )[0]
             except ValueError as error:
                 print("Skipping table:", error)
                 continue
 
-        table = flatten_headers(table)
-        print("Headers:", table.columns.tolist())
+            table = flatten_headers(table)
+            print("Headers:", table.columns.tolist())
 
-        table = clean_headers(table)
-        table = make_unique_columns(table)
+            table = clean_headers(table)
+            table = make_unique_columns(table)
 
-        if not is_scam_census_table(table):
+            if is_scam_census_table(table):
+                accepted_table = table
+                break
+
+        if accepted_table is None:
             continue
 
-        cleaned.append(select_scam_census_columns(table))
+        cleaned.append(select_scam_census_columns(accepted_table))
 
     if not cleaned:
         raise RuntimeError(
@@ -459,6 +459,7 @@ def flatten_headers(df):
 
 
 def clean_headers(df):
+    df = expand_embedded_header_values(df)
     df.columns = [
         _normalize_header(column)
         for column in df.columns
@@ -466,11 +467,19 @@ def clean_headers(df):
 
     rename = {
         "Subplot COL #": "Subplot",
+        "Subplot #": "Column",
         "Subplot Row Code": "Row_Code",
+        "Subplot Code": "Row",
+        "Subplot Code (see map)": "Row",
         "Consec Number 1, 2, 3... per quad": "Consec_Number",
         "Height (cm) (cm)": "Height_cm",
+        "Height Total (cm)": "Total_Height",
+        "Height Green (cm)": "Green_Height",
+        "Height Width (mm)": "Width_mm",
+        "Height Width (cm)": "Width_mm",
         "Width (mm) (only if > 200 cm)": "Width_mm",
         "Flower Y/N/C": "Flower",
+        "Flower? (Y/N/C)": "Flower",
         "Herbivory G/L/A/N": "Herbivory",
         "CEVO Flag #": "CEVO_Flag",
         "CH": "Chamber",
@@ -478,6 +487,7 @@ def clean_headers(df):
         "Col (see map)": "Column",
         "Row": "Row",
         "Species": "Species",
+        "Species (see list)": "Species",
         "Count": "Count",
         "Height Total (cm)": "Total_Height",
         "Height Green (cm)": "Green_Height",
@@ -490,7 +500,60 @@ def clean_headers(df):
     return df.rename(columns=rename)
 
 
+def expand_embedded_header_values(df):
+    df = df.copy()
+    renamed_columns = []
+    constants = {}
+
+    for column in df.columns:
+        normalized = _normalize_header(column)
+        embedded = _extract_embedded_header_value(normalized)
+
+        if embedded:
+            clean_column, value = embedded
+            renamed_columns.append(clean_column)
+            constants[clean_column] = value
+            continue
+
+        renamed_columns.append(normalized)
+
+    df.columns = renamed_columns
+
+    for column, value in constants.items():
+        df[column] = value
+
+    return df
+
+
+def _extract_embedded_header_value(column):
+    patterns = (
+        (r"^CH\s+(.+)$", "CH"),
+        (r"^Col(?:\s+\(see map\))?\s+(.+)$", "Col (see map)"),
+        (r"^Subplot\s+#\s+(.+)$", "Subplot #"),
+        (r"^Subplot\s+Code(?:\s+\(see map\))?\s+(.+)$", "Subplot Code"),
+        (r"^Row(?:\s+\(see list\))?\s+(.+)$", "Row"),
+        (r"^Species(?:\s+\(see list\))?\s+(.+)$", "Species (see list)"),
+        (r"^Flower\?\s+\(Y/N/C\)\s+(.+)$", "Flower? (Y/N/C)"),
+    )
+
+    for pattern, clean_column in patterns:
+        match = re.match(pattern, column, re.IGNORECASE)
+
+        if match:
+            value = match.group(1).strip()
+
+            if value.lower() in ("(see map)", "(see list)"):
+                return None
+
+            return clean_column, value
+
+    return None
+
+
 def is_scam_census_table(df):
+    if _has_measurement_row_table_shape(df):
+        return True
+
     return all(
         column in df.columns
         for column in SCAM_CENSUS_COLUMNS
@@ -498,12 +561,31 @@ def is_scam_census_table(df):
 
 
 def select_scam_census_columns(df):
+    if "Count" not in df.columns and _has_measurement_row_table_shape(df):
+        df = df.copy()
+        df["Count"] = 1
+
     df = df[SCAM_CENSUS_COLUMNS].copy()
 
     for column in ("Chamber", "Column", "Count", "Total_Height", "Green_Height", "Width_mm"):
         df[column] = df[column].map(_prefer_latter_ocr_candidate)
 
     return df
+
+
+def _has_measurement_row_table_shape(df):
+    required_columns = (
+        "Chamber",
+        "Column",
+        "Row",
+        "Species",
+        "Total_Height",
+        "Green_Height",
+        "Width_mm",
+        "Flower",
+    )
+
+    return all(column in df.columns for column in required_columns)
 
 
 def _prefer_latter_ocr_candidate(value):
