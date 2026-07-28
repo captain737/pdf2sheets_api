@@ -176,23 +176,40 @@ def _fetch_pipeline_step_results(execution, headers):
 
 
 def pipeline_result_to_excel(pipeline_result, output_dir, output_filename="converted.xlsx"):
-    dataframes = _extract_dataframes_from_pipeline_result(pipeline_result)
-    return dataframes_to_excel(dataframes, output_dir, output_filename)
+    dataframes, bbox_df = _extract_dataframes_and_bboxes_from_pipeline_result(
+        pipeline_result
+    )
+    return dataframes_to_excel(dataframes, output_dir, output_filename, bbox_df=bbox_df)
 
 
 def _extract_dataframes_from_pipeline_result(pipeline_result):
+    dataframes, _bbox_df = _extract_dataframes_and_bboxes_from_pipeline_result(
+        pipeline_result
+    )
+    return dataframes
+
+
+def _extract_dataframes_and_bboxes_from_pipeline_result(pipeline_result):
     step_results = pipeline_result.get("step_results") or []
     all_dataframes = []
+    bbox_dataframes = []
 
     for step_result in step_results:
-        dataframes = _extract_dataframes_from_value(step_result.get("result"))
+        dataframes, bbox_df = _extract_dataframes_and_bboxes_from_value(
+            step_result.get("result")
+        )
 
         all_dataframes.extend(dataframes)
 
-    if all_dataframes:
-        return all_dataframes
+        if not bbox_df.empty:
+            bbox_dataframes.append(bbox_df)
 
-    all_dataframes = _extract_dataframes_from_value(pipeline_result)
+    if all_dataframes:
+        return all_dataframes, _combine_bbox_dataframes(bbox_dataframes)
+
+    all_dataframes, bbox_df = _extract_dataframes_and_bboxes_from_value(
+        pipeline_result
+    )
 
     if not all_dataframes:
         raise RuntimeError(
@@ -200,24 +217,34 @@ def _extract_dataframes_from_pipeline_result(pipeline_result):
             "were found in the step results."
         )
 
-    return all_dataframes
+    return all_dataframes, bbox_df
 
 
 def _extract_dataframes_from_value(value):
+    dataframes, _bbox_df = _extract_dataframes_and_bboxes_from_value(value)
+    return dataframes
+
+
+def _extract_dataframes_and_bboxes_from_value(value):
     rendered_texts = []
     _collect_rendered_texts(value, rendered_texts)
+    bbox_dataframes = []
 
     if rendered_texts:
         dataframes = []
 
         for rendered_text in _dedupe_values(rendered_texts):
             try:
-                dataframes.extend(html_to_dataframes(rendered_text))
+                chunk_dataframes, bbox_df = html_to_dataframes_and_bboxes(rendered_text)
+                dataframes.extend(chunk_dataframes)
+
+                if not bbox_df.empty:
+                    bbox_dataframes.append(bbox_df)
             except RuntimeError as error:
                 print("Skipping rendered text chunk:", error)
 
         if dataframes:
-            return dataframes
+            return dataframes, _combine_bbox_dataframes(bbox_dataframes)
 
     table_values = []
     _collect_table_like_values(value, table_values)
@@ -230,7 +257,18 @@ def _extract_dataframes_from_value(value):
         if df is not None and df.shape[0] >= 1 and df.shape[1] >= 1:
             dataframes.append(_clean_dataframe(df))
 
-    return dataframes
+    return dataframes, pd.DataFrame()
+
+
+def _combine_bbox_dataframes(bbox_dataframes):
+    if not bbox_dataframes:
+        return pd.DataFrame()
+
+    return pd.concat(
+        bbox_dataframes,
+        ignore_index=True,
+        sort=False,
+    )
 
 
 def _collect_rendered_texts(value, rendered_texts):
@@ -326,11 +364,16 @@ def _value_to_dataframe(value):
 
 
 def html_to_excel(html, output_dir, output_filename="converted.xlsx"):
-    dataframes = html_to_dataframes(html)
-    return dataframes_to_excel(dataframes, output_dir, output_filename)
+    dataframes, bbox_df = html_to_dataframes_and_bboxes(html)
+    return dataframes_to_excel(dataframes, output_dir, output_filename, bbox_df=bbox_df)
 
 
 def html_to_dataframes(html):
+    dataframes, _bbox_df = html_to_dataframes_and_bboxes(html)
+    return dataframes
+
+
+def html_to_dataframes_and_bboxes(html):
     print("Reading botanical HTML tables...")
 
     soup = BeautifulSoup(
@@ -342,9 +385,11 @@ def html_to_dataframes(html):
     print("Tables found:", len(table_elements))
 
     cleaned = []
+    bbox_rows = []
 
     for index, table_element in enumerate(table_elements, start=1):
         print("Processing table", index)
+        bbox_rows.extend(extract_table_cell_bboxes(table_element, index))
 
         try:
             table = pd.read_html(
@@ -375,7 +420,54 @@ def html_to_dataframes(html):
             "No usable botanical tables found."
         )
 
-    return cleaned
+    bbox_df = pd.DataFrame(
+        bbox_rows,
+        columns=[
+            "table_index",
+            "row_index",
+            "col_index",
+            "cell_type",
+            "rowspan",
+            "colspan",
+            "text",
+            "bbox",
+            "confidence",
+        ],
+    )
+
+    return cleaned, bbox_df
+
+
+def extract_table_cell_bboxes(table_element, table_index):
+    rows = []
+
+    for row_index, row in enumerate(table_element.find_all("tr"), start=1):
+        col_index = 1
+
+        for cell in row.find_all(["th", "td"]):
+            bbox = cell.get("data-bbox")
+
+            if not bbox:
+                col_index += int(cell.get("colspan", "1"))
+                continue
+
+            rows.append(
+                {
+                    "table_index": table_index,
+                    "row_index": row_index,
+                    "col_index": col_index,
+                    "cell_type": cell.name,
+                    "rowspan": cell.get("rowspan", "1"),
+                    "colspan": cell.get("colspan", "1"),
+                    "text": _normalize_text(cell.get_text(" ", strip=True)),
+                    "bbox": bbox,
+                    "confidence": cell.get("data-confidence"),
+                }
+            )
+
+            col_index += int(cell.get("colspan", "1"))
+
+    return rows
 
 
 def flatten_headers(df):
@@ -617,7 +709,7 @@ def _strip_markdown_emphasis(value):
     return re.sub(r"\*\*(.*?)\*\*", r"\1", value).strip()
 
 
-def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx"):
+def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx", bbox_df=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(
         parents=True,
@@ -633,12 +725,20 @@ def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx"
     )
     final = remove_crossed_out_rows(final)
 
-    final.to_excel(
-        output_file,
-        index=False,
-        sheet_name="Data",
-        engine="openpyxl",
-    )
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        final.to_excel(
+            writer,
+            index=False,
+            sheet_name="Data",
+        )
+
+        if bbox_df is not None and not bbox_df.empty:
+            bbox_df.to_excel(
+                writer,
+                index=False,
+                sheet_name="Cell_BBoxes",
+            )
+            print(f"Saved {len(bbox_df)} bbox cells")
 
     print("Saved:", output_file)
 
