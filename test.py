@@ -424,7 +424,7 @@ def looks_like_botanical_data_table_element(table_element):
         if re.search(rf"\b{re.escape(signal)}\b", text)
     )
 
-    return matches >= 3
+    return matches >= 2
 
 
 def flatten_headers(df):
