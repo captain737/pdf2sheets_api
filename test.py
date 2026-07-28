@@ -401,13 +401,9 @@ def looks_like_scam_census_table_element(table_element):
         "ch",
         "species",
         "count",
-        "width",
-        "flower",
     )
 
-    has_height_columns = "height" in text or ("total" in text and "green" in text)
-
-    return all(word in text for word in required_words) and has_height_columns
+    return all(word in text for word in required_words)
 
 
 def flatten_headers(df):
