@@ -1,7 +1,3 @@
-# pdf2sheets_api
-
-FastAPI web app that accepts botanical PDF sheets, runs Datalab Convert, saves the intermediate Datalab HTML outputs, parses the selected full/default HTML artifact, and returns a zip containing both the final Excel sheet and debugging HTML files.
-
 ## What The App Returns
 
 Uploading a PDF downloads:
