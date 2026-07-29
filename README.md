@@ -25,16 +25,86 @@ intermediate_html/<run-id>-02.html
 ## Datalab Setup
 
 1. Log in to Datalab.
-2. Go to your account/API settings.
-3. Generate an API key.
-4. Copy the key.
-5. Create a local `.env` file from the example:
+2. Open the pipeline you want this app to use.
+3. Copy the pipeline ID and version number.
+4. Go to your account/API settings.
+5. Generate an API key.
+6. Copy the key.
+7. Keep the key private. Do not paste it into GitHub, Slack, email, or the source code.
+
+The app expects this pipeline:
+
+```text
+pipeline_id = pl_4AHLbwoxranz
+version = 3
+```
+
+## Local Setup From Scratch
+
+### 1. Open Terminal
+
+On macOS:
+
+1. Press `Command + Space`.
+2. Type `Terminal`.
+3. Press `Enter`.
+
+### 2. Go To The Project Folder
+
+If you already downloaded or cloned the repo, move into it:
+
+```bash
+cd /path/to/pdf2sheets_api
+```
+
+Example:
+
+```bash
+cd ~/Downloads/pdf2sheets_api
+```
+
+If you are cloning from GitHub:
+
+```bash
+git clone https://github.com/captain737/pdf2sheets_api.git
+cd pdf2sheets_api
+```
+
+### 3. Create A Python Virtual Environment
+
+```bash
+python3 -m venv .venv
+```
+
+Activate it:
+
+```bash
+source .venv/bin/activate
+```
+
+After activation, your terminal prompt may show `(.venv)`.
+
+### 4. Install Requirements
+
+```bash
+pip install -r requirements.txt
+```
+
+### 5. Create The `.env` File
+
+You can either copy the example:
 
 ```bash
 cp .env.example .env
 ```
 
-6. Edit `.env` and paste your key:
+Or create it manually with `nano`:
+
+```bash
+nano .env
+```
+
+Paste this into the file:
 
 ```env
 DATALAB_API_KEY=your_real_datalab_api_key
@@ -42,29 +112,87 @@ DATALAB_PIPELINE_ID=pl_4AHLbwoxranz
 DATALAB_PIPELINE_VERSION=3
 ```
 
-Do not commit `.env`. It is ignored by git.
+Replace:
 
-## Install
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+```text
+your_real_datalab_api_key
 ```
 
-## Run The Website
+with your real Datalab API key. If you use a different Datalab pipeline later, also replace `DATALAB_PIPELINE_ID` and `DATALAB_PIPELINE_VERSION`.
+
+To save and exit `nano`:
+
+```text
+Ctrl + O
+Enter
+Ctrl + X
+```
+
+Do not commit `.env`. It is ignored by git.
+
+The `.env.example` file is safe to commit because it contains placeholders only. The real `.env` file should stay only on your computer or on the computer/server running the app.
+
+### 6. Check That `.env` Exists
+
+```bash
+ls -la .env
+```
+
+You should see `.env` listed.
+
+### 7. Run The Website
 
 ```bash
 python3 -m uvicorn main:app --reload
 ```
 
-Open:
+Open this in your browser:
 
 ```text
 http://127.0.0.1:8000
 ```
 
 Upload a PDF. The browser will download a zip with the parsed Excel and intermediate HTML.
+
+### 8. If Port 8000 Is Already In Use
+
+If you see:
+
+```text
+ERROR: [Errno 48] Address already in use
+```
+
+something is already running on port `8000`.
+
+Find it:
+
+```bash
+lsof -nP -iTCP:8000 -sTCP:LISTEN
+```
+
+Stop the listed process IDs:
+
+```bash
+kill <PID>
+```
+
+Then run the website again:
+
+```bash
+python3 -m uvicorn main:app --reload
+```
+
+Or run on another port:
+
+```bash
+python3 -m uvicorn main:app --reload --port 8001
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8001
+```
 
 ## Datalab API Behavior
 
@@ -109,6 +237,8 @@ The parser:
 - removes crossed-out rows and full-X placeholder rows
 
 ## CLI Upload Test
+
+With the website running, you can test an upload from Terminal:
 
 ```bash
 curl -X POST \
