@@ -18,21 +18,22 @@ DATALAB_API_BASE_URL = os.getenv(
     "DATALAB_API_BASE_URL",
     "https://www.datalab.to/api/v1",
 ).rstrip("/")
-DATALAB_PIPELINE_ID = os.getenv("DATALAB_PIPELINE_ID", "pl_4AHLbwoxranz")
-DATALAB_PIPELINE_VERSION = os.getenv("DATALAB_PIPELINE_VERSION")
+DATALAB_CONVERT_MODE = os.getenv("DATALAB_CONVERT_MODE", "accurate")
+DATALAB_OUTPUT_FORMAT = os.getenv("DATALAB_OUTPUT_FORMAT", "html")
+DATALAB_EXTRAS = os.getenv("DATALAB_EXTRAS", "table_cell_bboxes")
 DATALAB_POLL_INTERVAL_SECONDS = int(os.getenv("DATALAB_POLL_INTERVAL_SECONDS", "2"))
 DATALAB_TIMEOUT_SECONDS = int(os.getenv("DATALAB_TIMEOUT_SECONDS", "900"))
 
 
 def chandra_convert(pdf_path):
     """
-    Run the configured Datalab Chandra OCR pipeline and return its step results.
+    Run Datalab Convert with the same options as the playground setup.
     """
 
-    return run_chandra_pipeline(pdf_path)
+    return run_chandra_convert(pdf_path)
 
 
-def run_chandra_pipeline(pdf_path, pipeline_id=None):
+def run_chandra_convert(pdf_path):
     api_key = os.getenv("DATALAB_API_KEY")
 
     if not api_key:
@@ -40,7 +41,6 @@ def run_chandra_pipeline(pdf_path, pipeline_id=None):
             "DATALAB_API_KEY missing. Add it to .env or export it in terminal."
         )
 
-    pipeline_id = pipeline_id or DATALAB_PIPELINE_ID
     pdf_path = Path(pdf_path)
     headers = {
         "X-API-Key": api_key,
@@ -49,18 +49,30 @@ def run_chandra_pipeline(pdf_path, pipeline_id=None):
     }
 
     data = {
+        "mode": DATALAB_CONVERT_MODE,
+        "output_format": DATALAB_OUTPUT_FORMAT,
+        "paginate": "true",
+        "merge_cross_page": "false",
+        "disable_image_captions": "true",
+        "disable_image_extraction": "true",
         "skip_cache": "true",
-        "output_format": "html",
+        "additional_config": json.dumps(
+            {
+                "keep_pageheader_in_output": False,
+                "keep_pagefooter_in_output": False,
+            }
+        ),
     }
 
-    if DATALAB_PIPELINE_VERSION:
-        data["version"] = DATALAB_PIPELINE_VERSION
+    if DATALAB_EXTRAS:
+        data["extras"] = DATALAB_EXTRAS
 
-    print(f"Running Datalab Chandra OCR pipeline: {pipeline_id}")
+    print("Running Datalab Convert")
+    print("Datalab Convert options:", data)
 
     with open(pdf_path, "rb") as file_handle:
         response = requests.post(
-            f"{DATALAB_API_BASE_URL}/pipelines/{pipeline_id}/run",
+            f"{DATALAB_API_BASE_URL}/convert",
             headers=headers,
             files={
                 "file": (
@@ -73,112 +85,104 @@ def run_chandra_pipeline(pdf_path, pipeline_id=None):
             timeout=60,
         )
 
-    print("Datalab pipeline submit status:", response.status_code)
+    print("Datalab Convert submit status:", response.status_code)
 
     if not response.ok:
         raise RuntimeError(
-            f"Datalab pipeline submit failed "
+            f"Datalab Convert submit failed "
             f"({response.status_code}): {response.text}"
         )
 
     submission = response.json()
-    execution_id = submission.get("execution_id")
+    request_id = submission.get("request_id")
 
-    if not execution_id:
+    if not request_id:
         raise RuntimeError(
-            f"Datalab pipeline response did not include execution_id: {submission}"
+            f"Datalab Convert response did not include request_id: {submission}"
         )
 
-    execution = _poll_pipeline_execution(execution_id, headers)
-    step_results = _fetch_pipeline_step_results(execution, headers)
+    result = _poll_convert_request(request_id, headers)
 
     return {
-        "execution": execution,
-        "step_results": step_results,
+        "execution": {
+            "request_id": request_id,
+            "status": result.get("status"),
+            "mode": DATALAB_CONVERT_MODE,
+            "output_format": DATALAB_OUTPUT_FORMAT,
+            "extras": DATALAB_EXTRAS,
+        },
+        "step_results": [
+            {
+                "step": {
+                    "status": result.get("status"),
+                    "type": "convert",
+                },
+                "result": result,
+            }
+        ],
     }
 
 
-def _poll_pipeline_execution(execution_id, headers):
+def _poll_convert_request(request_id, headers):
     deadline = time.monotonic() + DATALAB_TIMEOUT_SECONDS
 
     while time.monotonic() < deadline:
         response = requests.get(
-            f"{DATALAB_API_BASE_URL}/pipelines/executions/{execution_id}",
+            f"{DATALAB_API_BASE_URL}/convert/{request_id}",
             headers=headers,
             timeout=60,
         )
 
         if not response.ok:
             raise RuntimeError(
-                f"Datalab pipeline poll failed "
+                f"Datalab Convert poll failed "
                 f"({response.status_code}): {response.text}"
             )
 
-        execution = response.json()
-        status = execution.get("status")
+        result = response.json()
+        status = result.get("status")
 
-        print("Datalab pipeline status:", status)
+        print("Datalab Convert status:", status)
 
-        if status in ("completed", "completed_with_errors"):
-            return execution
+        if status in ("complete", "completed", "completed_with_errors"):
+            result = _hydrate_convert_result(result)
+            return result
 
-        if status == "failed":
+        if status in ("failed", "error"):
             raise RuntimeError(
-                f"Datalab pipeline failed: {execution}"
+                f"Datalab Convert failed: {result}"
             )
 
         time.sleep(DATALAB_POLL_INTERVAL_SECONDS)
 
     raise TimeoutError(
-        "Timed out waiting for Datalab pipeline execution to finish."
+        "Timed out waiting for Datalab Convert to finish."
     )
 
 
-def _fetch_pipeline_step_results(execution, headers):
-    execution_id = execution.get("execution_id")
-    steps = execution.get("steps") or []
-    results = []
+def _hydrate_convert_result(result):
+    if result.get("html") or not result.get("result_url"):
+        return result
 
-    for fallback_index, step in enumerate(steps):
-        if step.get("status") != "completed":
-            continue
+    response = requests.get(
+        result["result_url"],
+        timeout=60,
+    )
 
-        step_index = (
-            step.get("step_index")
-            or step.get("index")
-            or fallback_index
-        )
+    if not response.ok:
+        return result
 
-        response = requests.get(
-            (
-                f"{DATALAB_API_BASE_URL}/pipelines/executions/"
-                f"{execution_id}/steps/{step_index}/result"
-            ),
-            headers=headers,
-            timeout=60,
-        )
+    try:
+        downloaded_result = response.json()
+    except ValueError:
+        return result
 
-        if not response.ok:
-            print(
-                f"Skipping step {step_index} result:",
-                response.status_code,
-                response.text,
-            )
-            continue
+    if isinstance(downloaded_result, dict):
+        merged_result = dict(result)
+        merged_result.update(downloaded_result)
+        return merged_result
 
-        results.append(
-            {
-                "step": step,
-                "result": response.json(),
-            }
-        )
-
-    if not results:
-        raise RuntimeError(
-            f"No completed pipeline step results found: {execution}"
-        )
-
-    return results
+    return result
 
 
 def pipeline_result_to_excel(
@@ -1841,10 +1845,13 @@ def convert_pdf_to_excel(
         run_metadata={
             "source_pdf": pdf_path.name,
             "output_file": output_filename,
-            "pipeline_id": DATALAB_PIPELINE_ID,
-            "execution_id": (
+            "datalab_api": "convert",
+            "datalab_mode": DATALAB_CONVERT_MODE,
+            "datalab_output_format": DATALAB_OUTPUT_FORMAT,
+            "datalab_extras": DATALAB_EXTRAS,
+            "request_id": (
                 pipeline_result.get("execution") or {}
-            ).get("execution_id"),
+            ).get("request_id"),
         },
     )
 

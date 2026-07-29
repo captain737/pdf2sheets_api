@@ -1,6 +1,6 @@
 # pdf2sheets_api
 
-FastAPI web app that accepts botanical PDF sheets, runs a Datalab pipeline, saves the intermediate Datalab HTML outputs, parses the selected full/default HTML artifact, and returns a zip containing both the final Excel sheet and debugging HTML files.
+FastAPI web app that accepts botanical PDF sheets, runs Datalab Convert, saves the intermediate Datalab HTML outputs, parses the selected full/default HTML artifact, and returns a zip containing both the final Excel sheet and debugging HTML files.
 
 ## What The App Returns
 
@@ -25,19 +25,12 @@ intermediate_html/<run-id>-02.html
 ## Datalab Setup
 
 1. Log in to Datalab.
-2. Open the pipeline you want this app to use.
-3. Copy the pipeline ID and version number.
-4. Go to your account/API settings.
-5. Generate an API key.
-6. Copy the key.
-7. Keep the key private. Do not paste it into GitHub, Slack, email, or the source code.
+2. Go to your account/API settings.
+3. Generate an API key.
+4. Copy the key.
+5. Keep the key private. Do not paste it into GitHub, Slack, email, or the source code.
 
-The app expects this pipeline:
-
-```text
-pipeline_id = pl_4AHLbwoxranz
-version = 3
-```
+This app does not require access to the saved pipeline in the original developer account. It recreates the same playground settings with the Datalab Convert API.
 
 ## Local Setup From Scratch
 
@@ -108,8 +101,9 @@ Paste this into the file:
 
 ```env
 DATALAB_API_KEY=your_real_datalab_api_key
-DATALAB_PIPELINE_ID=pl_4AHLbwoxranz
-DATALAB_PIPELINE_VERSION=3
+DATALAB_CONVERT_MODE=accurate
+DATALAB_OUTPUT_FORMAT=html
+DATALAB_EXTRAS=table_cell_bboxes
 ```
 
 Replace:
@@ -118,7 +112,7 @@ Replace:
 your_real_datalab_api_key
 ```
 
-with your real Datalab API key. If you use a different Datalab pipeline later, also replace `DATALAB_PIPELINE_ID` and `DATALAB_PIPELINE_VERSION`.
+with your real Datalab API key. The other values recreate the Datalab playground options used for this parser.
 
 To save and exit `nano`:
 
@@ -196,33 +190,21 @@ http://127.0.0.1:8001
 
 ## Datalab API Behavior
 
-The app calls the configured Datalab pipeline with:
+The app calls Datalab Convert directly with these form fields:
 
-```python
-pipeline_id = "pl_4AHLbwoxranz"
-version = 3
-skip_cache = true
-output_format = "html"
+```text
+mode=accurate
+output_format=html
+paginate=true
+merge_cross_page=false
+disable_image_captions=true
+disable_image_extraction=true
+extras=table_cell_bboxes
+skip_cache=true
+additional_config={"keep_pageheader_in_output": false, "keep_pagefooter_in_output": false}
 ```
 
-The direct SDK equivalent is:
-
-```python
-from datalab_sdk import DatalabClient, ConvertOptions
-
-client = DatalabClient()
-
-options = ConvertOptions(
-    output_format="html",
-    mode="balanced",
-    paginate=True,
-)
-
-result = client.convert("document.pdf", options=options)
-print(result.html)
-```
-
-For this app, the important part is requesting HTML output from Datalab so the parser can read rendered table pages.
+These settings mirror the Datalab playground setup: Accurate mode, Paginate on, Disable Image Captions on, Disable Image Extraction on, and Table Cell Bboxes on. The app does not need a saved Datalab pipeline ID.
 
 ## Parser Notes
 
