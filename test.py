@@ -2,7 +2,6 @@ import json
 import os
 import re
 import time
-from difflib import SequenceMatcher
 from io import StringIO
 from pathlib import Path
 
@@ -10,7 +9,6 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from openpyxl.styles import Alignment
 
 
 load_dotenv()
@@ -23,69 +21,6 @@ DATALAB_PIPELINE_ID = os.getenv("DATALAB_PIPELINE_ID", "pl_4AHLbwoxranz")
 DATALAB_PIPELINE_VERSION = os.getenv("DATALAB_PIPELINE_VERSION")
 DATALAB_POLL_INTERVAL_SECONDS = int(os.getenv("DATALAB_POLL_INTERVAL_SECONDS", "2"))
 DATALAB_TIMEOUT_SECONDS = int(os.getenv("DATALAB_TIMEOUT_SECONDS", "900"))
-SCAM_CENSUS_COLUMNS = [
-    "Chamber",
-    "Column",
-    "Row",
-    "Species",
-    "Count",
-    "Total_Height",
-    "Green_Height",
-    "Width_mm",
-    "Flower",
-]
-FUZZY_HEADER_TARGETS = {
-    "Chamber": (
-        "ch",
-        "chamber",
-    ),
-    "Column": (
-        "col",
-        "column",
-        "col see map",
-        "subplot",
-        "subplot #",
-        "subplot number",
-    ),
-    "Row": (
-        "row",
-        "subplot code",
-        "sub code",
-        "sub sub code",
-        "row code",
-    ),
-    "Species": (
-        "species",
-        "species see list",
-    ),
-    "Count": (
-        "count",
-        "consec number",
-        "consecutive number",
-        "number",
-    ),
-    "Total_Height": (
-        "height total cm",
-        "total height",
-        "total cm",
-    ),
-    "Green_Height": (
-        "height green cm",
-        "green height",
-        "green cm",
-    ),
-    "Width_mm": (
-        "width mm",
-        "height width mm",
-        "width",
-    ),
-    "Flower": (
-        "flower",
-        "flower y n c",
-        "flower ync",
-    ),
-}
-FUZZY_HEADER_MIN_SCORE = 0.78
 
 
 def chandra_convert(pdf_path):
@@ -361,22 +296,13 @@ def _dedupe_values(values):
     deduped = []
 
     for value in values:
-        key = _dedupe_key(value)
-
-        if key in seen:
+        if value in seen:
             continue
 
-        seen.add(key)
+        seen.add(value)
         deduped.append(value)
 
     return deduped
-
-
-def _dedupe_key(value):
-    if isinstance(value, str):
-        return value
-
-    return repr(value)
 
 
 def _value_to_dataframe(value):
@@ -418,36 +344,31 @@ def html_to_dataframes(html):
     cleaned = []
 
     for index, table_element in enumerate(table_elements, start=1):
-        if not looks_like_botanical_data_table_element(table_element):
-            continue
-
         print("Processing table", index)
-        accepted_table = None
 
-        for header in ([0, 1], 0):
+        try:
+            table = pd.read_html(
+                StringIO(str(table_element)),
+                header=[0, 1],
+            )[0]
+        except ValueError:
             try:
                 table = pd.read_html(
                     StringIO(str(table_element)),
-                    header=header,
+                    header=0,
                 )[0]
             except ValueError as error:
                 print("Skipping table:", error)
                 continue
 
-            table = flatten_headers(table)
-            print("Headers:", table.columns.tolist())
+        table = flatten_headers(table)
+        print("Headers:", table.columns.tolist())
 
-            table = clean_headers(table)
-            table = make_unique_columns(table)
+        table = clean_headers(table)
+        table = make_unique_columns(table)
 
-            if is_scam_census_table(table):
-                accepted_table = table
-                break
-
-        if accepted_table is None:
-            continue
-
-        cleaned.append(select_scam_census_columns(accepted_table))
+        if is_data_table(table):
+            cleaned.append(table)
 
     if not cleaned:
         raise RuntimeError(
@@ -455,38 +376,6 @@ def html_to_dataframes(html):
         )
 
     return cleaned
-
-
-def looks_like_botanical_data_table_element(table_element):
-    text = _normalize_header(table_element.get_text(" ", strip=True)).lower()
-    rows = table_element.find_all("tr")
-
-    if len(rows) < 4:
-        return False
-
-    signals = (
-        "ch",
-        "species",
-        "count",
-        "sub",
-        "subplot",
-        "code",
-        "consec",
-        "number",
-        "plot",
-        "quadrant",
-        "quad",
-        "height",
-        "width",
-        "flower",
-    )
-    matches = sum(
-        1
-        for signal in signals
-        if re.search(rf"\b{re.escape(signal)}\b", text)
-    )
-
-    return matches >= 2
 
 
 def flatten_headers(df):
@@ -512,7 +401,6 @@ def flatten_headers(df):
 
 
 def clean_headers(df):
-    df = expand_embedded_header_values(df)
     df.columns = [
         _normalize_header(column)
         for column in df.columns
@@ -520,19 +408,11 @@ def clean_headers(df):
 
     rename = {
         "Subplot COL #": "Subplot",
-        "Subplot #": "Column",
         "Subplot Row Code": "Row_Code",
-        "Subplot Code": "Row",
-        "Subplot Code (see map)": "Row",
         "Consec Number 1, 2, 3... per quad": "Consec_Number",
         "Height (cm) (cm)": "Height_cm",
-        "Height Total (cm)": "Total_Height",
-        "Height Green (cm)": "Green_Height",
-        "Height Width (mm)": "Width_mm",
-        "Height Width (cm)": "Width_mm",
         "Width (mm) (only if > 200 cm)": "Width_mm",
         "Flower Y/N/C": "Flower",
-        "Flower? (Y/N/C)": "Flower",
         "Herbivory G/L/A/N": "Herbivory",
         "CEVO Flag #": "CEVO_Flag",
         "CH": "Chamber",
@@ -540,7 +420,6 @@ def clean_headers(df):
         "Col (see map)": "Column",
         "Row": "Row",
         "Species": "Species",
-        "Species (see list)": "Species",
         "Count": "Count",
         "Height Total (cm)": "Total_Height",
         "Height Green (cm)": "Green_Height",
@@ -550,152 +429,7 @@ def clean_headers(df):
         "Width": "Width_mm",
     }
 
-    df = df.rename(columns=rename)
-    df.columns = [
-        fuzzy_match_header(column)
-        for column in df.columns
-    ]
-
-    return df
-
-
-def fuzzy_match_header(column):
-    column = _normalize_header(column)
-
-    if column in SCAM_CENSUS_COLUMNS:
-        return column
-
-    normalized_column = _normalize_header_for_match(column)
-    best_target = column
-    best_score = 0
-
-    for target, candidates in FUZZY_HEADER_TARGETS.items():
-        for candidate in candidates:
-            score = SequenceMatcher(
-                None,
-                normalized_column,
-                _normalize_header_for_match(candidate),
-            ).ratio()
-
-            if score > best_score:
-                best_target = target
-                best_score = score
-
-    if best_score >= FUZZY_HEADER_MIN_SCORE:
-        return best_target
-
-    return column
-
-
-def _normalize_header_for_match(value):
-    return re.sub(
-        r"[^a-z0-9]+",
-        " ",
-        str(value).lower(),
-    ).strip()
-
-
-def expand_embedded_header_values(df):
-    df = df.copy()
-    renamed_columns = []
-    constants = {}
-
-    for column in df.columns:
-        normalized = _normalize_header(column)
-        embedded = _extract_embedded_header_value(normalized)
-
-        if embedded:
-            clean_column, value = embedded
-            renamed_columns.append(clean_column)
-            constants[clean_column] = value
-            continue
-
-        renamed_columns.append(normalized)
-
-    df.columns = renamed_columns
-
-    for column, value in constants.items():
-        df[column] = value
-
-    return df
-
-
-def _extract_embedded_header_value(column):
-    patterns = (
-        (r"^CH\s+(.+)$", "CH"),
-        (r"^Col(?:\s+\(see map\))?\s+(.+)$", "Col (see map)"),
-        (r"^Subplot\s+#\s+(.+)$", "Subplot #"),
-        (r"^Subplot\s+Code(?:\s+\(see map\))?\s+(.+)$", "Subplot Code"),
-        (r"^Row(?:\s+\(see list\))?\s+(.+)$", "Row"),
-        (r"^Species(?:\s+\(see list\))?\s+(.+)$", "Species (see list)"),
-        (r"^Flower\?\s+\(Y/N/C\)\s+(.+)$", "Flower? (Y/N/C)"),
-    )
-
-    for pattern, clean_column in patterns:
-        match = re.match(pattern, column, re.IGNORECASE)
-
-        if match:
-            value = match.group(1).strip()
-
-            if value.lower() in ("(see map)", "(see list)"):
-                return None
-
-            return clean_column, value
-
-    return None
-
-
-def is_scam_census_table(df):
-    if _has_measurement_row_table_shape(df):
-        return True
-
-    return all(
-        column in df.columns
-        for column in SCAM_CENSUS_COLUMNS
-    )
-
-
-def select_scam_census_columns(df):
-    if "Count" not in df.columns and _has_measurement_row_table_shape(df):
-        df = df.copy()
-        df["Count"] = 1
-
-    df = df[SCAM_CENSUS_COLUMNS].copy()
-
-    for column in ("Chamber", "Column", "Count", "Total_Height", "Green_Height", "Width_mm"):
-        df[column] = df[column].map(_prefer_latter_ocr_candidate)
-
-    return df
-
-
-def _has_measurement_row_table_shape(df):
-    required_columns = (
-        "Chamber",
-        "Column",
-        "Row",
-        "Species",
-        "Total_Height",
-        "Green_Height",
-        "Width_mm",
-        "Flower",
-    )
-
-    return all(column in df.columns for column in required_columns)
-
-
-def _prefer_latter_ocr_candidate(value):
-    if value is None:
-        return value
-
-    if isinstance(value, float) and pd.isna(value):
-        return value
-
-    text = str(value).strip()
-
-    if not re.fullmatch(r"\d+(?:\.\d+)?\s+\d+(?:\.\d+)?", text):
-        return value
-
-    return text.split()[-1]
+    return df.rename(columns=rename)
 
 
 def _normalize_header(value):
@@ -753,7 +487,7 @@ def _dedupe_adjacent(values):
     deduped = []
 
     for value in values:
-        if deduped and _dedupe_key(deduped[-1]) == _dedupe_key(value):
+        if deduped and deduped[-1] == value:
             continue
 
         deduped.append(value)
@@ -899,18 +633,12 @@ def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx"
     )
     final = remove_crossed_out_rows(final)
 
-    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-        final.to_excel(
-            writer,
-            index=False,
-            sheet_name="Data",
-        )
-        worksheet = writer.sheets["Data"]
-        right_alignment = Alignment(horizontal="right")
-
-        for row in worksheet.iter_rows():
-            for cell in row:
-                cell.alignment = right_alignment
+    final.to_excel(
+        output_file,
+        index=False,
+        sheet_name="Data",
+        engine="openpyxl",
+    )
 
     print("Saved:", output_file)
 
@@ -975,10 +703,7 @@ def _clean_dataframe(df):
 
 
 def _clean_cell(value):
-    if value is None:
-        return value
-
-    if isinstance(value, float) and pd.isna(value):
+    if pd.isna(value):
         return value
 
     return (
