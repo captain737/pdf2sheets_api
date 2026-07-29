@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+from difflib import SequenceMatcher
 from io import StringIO
 from pathlib import Path
 
@@ -43,9 +44,14 @@ def run_chandra_pipeline(pdf_path, pipeline_id=None):
     pdf_path = Path(pdf_path)
     headers = {
         "X-API-Key": api_key,
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
 
-    data = {}
+    data = {
+        "skip_cache": "true",
+        "output_format": "html",
+    }
 
     if DATALAB_PIPELINE_VERSION:
         data["version"] = DATALAB_PIPELINE_VERSION
@@ -175,22 +181,140 @@ def _fetch_pipeline_step_results(execution, headers):
     return results
 
 
-def pipeline_result_to_excel(pipeline_result, output_dir, output_filename="converted.xlsx"):
+def pipeline_result_to_excel(
+    pipeline_result,
+    output_dir,
+    output_filename="converted.xlsx",
+    run_metadata=None,
+):
     dataframes = _extract_dataframes_from_pipeline_result(pipeline_result)
-    return dataframes_to_excel(dataframes, output_dir, output_filename)
+    return dataframes_to_excel(
+        dataframes,
+        output_dir,
+        output_filename,
+        run_metadata=run_metadata,
+    )
+
+
+def save_intermediate_html_outputs(
+    pipeline_result,
+    output_dir,
+    filename_prefix="intermediate",
+):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    rendered_texts = _collect_pipeline_rendered_texts(pipeline_result)
+
+    html_files = []
+    html_documents = []
+
+    for index, rendered_text in enumerate(rendered_texts, start=1):
+        html_document = _as_html_document(rendered_text)
+        html_file = output_dir / f"{filename_prefix}-{index:02d}.html"
+        html_file.write_text(
+            html_document,
+            encoding="utf-8",
+        )
+        html_files.append(str(html_file))
+        html_documents.append((html_file, html_document))
+
+    default_html = _select_default_html_document(html_documents)
+
+    if default_html:
+        default_file = output_dir / "default.html"
+        default_file.write_text(
+            default_html,
+            encoding="utf-8",
+        )
+        html_files.insert(0, str(default_file))
+
+    return html_files
+
+
+def _as_html_document(value):
+    stripped = str(value).strip()
+
+    if "<html" in stripped.lower():
+        return stripped
+
+    return (
+        "<!DOCTYPE html>\n"
+        "<html>\n"
+        "<head><meta charset=\"utf-8\"></head>\n"
+        "<body>\n"
+        f"{stripped}\n"
+        "</body>\n"
+        "</html>\n"
+    )
+
+
+def _select_default_html_document(html_documents):
+    if not html_documents:
+        return None
+
+    return max(
+        html_documents,
+        key=lambda item: _html_document_score(item[1]),
+    )[1]
+
+
+def _html_document_score(html_document):
+    lowered = html_document.lower()
+    page_markers = len(
+        re.findall(
+            r"\bpage\s*:?\s*\d+\s+of\s+\d+",
+            html_document,
+            re.IGNORECASE,
+        )
+    )
+    real_tables = lowered.count("<table")
+    markdown_table_lines = sum(
+        1
+        for line in html_document.splitlines()
+        if line.strip().startswith("|") and line.strip().endswith("|")
+    )
+
+    return (
+        page_markers * 10000
+        + real_tables * 1000
+        + markdown_table_lines * 50
+        + len(html_document)
+    )
+
+
+def _collect_pipeline_rendered_texts(pipeline_result):
+    rendered_texts = []
+
+    for step_result in pipeline_result.get("step_results") or []:
+        _collect_rendered_texts(step_result.get("result"), rendered_texts)
+
+    if not rendered_texts:
+        _collect_rendered_texts(pipeline_result, rendered_texts)
+
+    return _dedupe_values(rendered_texts)
 
 
 def _extract_dataframes_from_pipeline_result(pipeline_result):
-    step_results = pipeline_result.get("step_results") or []
-    all_dataframes = []
+    rendered_texts = _collect_pipeline_rendered_texts(pipeline_result)
 
-    for step_result in step_results:
-        dataframes = _extract_dataframes_from_value(step_result.get("result"))
+    if rendered_texts:
+        default_html = _select_default_html_document(
+            [
+                (None, _as_html_document(rendered_text))
+                for rendered_text in rendered_texts
+            ]
+        )
 
-        all_dataframes.extend(dataframes)
+        if default_html:
+            dataframes = _extract_dataframes_from_value(default_html)
 
-    if all_dataframes:
-        return all_dataframes
+            if dataframes:
+                print("Parsing selected default intermediate HTML only")
+                return dataframes
 
     all_dataframes = _extract_dataframes_from_value(pipeline_result)
 
@@ -342,40 +466,616 @@ def html_to_dataframes(html):
     print("Tables found:", len(table_elements))
 
     cleaned = []
+    previous_columns = None
 
     for index, table_element in enumerate(table_elements, start=1):
         print("Processing table", index)
+        table_element = _mark_crossed_out_cells(table_element)
 
+        table = _best_table_dataframe(table_element, previous_columns)
+
+        if table is not None and is_data_table(table):
+            print("Headers:", table.columns.tolist())
+            cleaned.append(table)
+            previous_columns = table.columns.tolist()
+
+    if not cleaned:
+        cleaned = markdown_tables_to_dataframes(html)
+
+    if not cleaned:
+        raise RuntimeError("No usable botanical tables found.")
+
+    return cleaned
+
+
+def markdown_tables_to_dataframes(html):
+    markdown_text = _html_to_markdownish_text(html)
+    table_blocks = _markdown_table_blocks(markdown_text)
+    cleaned = []
+
+    for block in table_blocks:
+        table = _markdown_block_to_dataframe(block)
+
+        if table is None:
+            continue
+
+        table = _normalize_candidate_table(table)
+
+        if is_data_table(table):
+            print("Markdown headers:", table.columns.tolist())
+            cleaned.append(table)
+
+    return cleaned
+
+
+def _html_to_markdownish_text(html):
+    html = re.sub(
+        r"<del>(.*?)</del>",
+        r"\1 crossed out",
+        str(html),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    html = re.sub(
+        r"<br\s*/?>",
+        " ",
+        html,
+        flags=re.IGNORECASE,
+    )
+
+    return BeautifulSoup(html, "html.parser").get_text("\n")
+
+
+def _markdown_table_blocks(text):
+    blocks = []
+    current = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+
+        if stripped.startswith("|") and stripped.endswith("|"):
+            current.append(stripped)
+            continue
+
+        if current:
+            blocks.append(current)
+            current = []
+
+    if current:
+        blocks.append(current)
+
+    return blocks
+
+
+def _markdown_block_to_dataframe(block):
+    rows = [
+        _split_markdown_row(line)
+        for line in block
+    ]
+    rows = [
+        row
+        for row in rows
+        if not _is_markdown_separator_row(row)
+    ]
+
+    if len(rows) < 2:
+        return None
+
+    header_rows = []
+    data_start = None
+
+    for index, row in enumerate(rows):
+        if _markdown_row_starts_data(row):
+            data_start = index
+            break
+
+        header_rows.append(row)
+
+    if data_start is None or not header_rows:
+        return None
+
+    headers = _headers_from_grid_rows(header_rows[:2])
+    data_rows = [
+        _fit_row_to_width(row, len(headers))
+        for row in rows[data_start:]
+        if _row_has_meaningful_value(row)
+    ]
+
+    if not data_rows:
+        return None
+
+    return pd.DataFrame(data_rows, columns=headers)
+
+
+def _split_markdown_row(line):
+    return [
+        _clean_markdown_cell(cell)
+        for cell in line.strip().strip("|").split("|")
+    ]
+
+
+def _clean_markdown_cell(value):
+    value = re.sub(r"\*+", "", str(value))
+    value = value.replace("\xa0", " ")
+    value = re.sub(r"\s+", " ", value)
+
+    return value.strip()
+
+
+def _is_markdown_separator_row(row):
+    return all(
+        not cell
+        or re.fullmatch(r":?-{2,}:?", cell.replace(" ", ""))
+        for cell in row
+    )
+
+
+def _markdown_row_starts_data(row):
+    if not row:
+        return False
+
+    return bool(re.fullmatch(r"\d+", str(row[0]).strip()))
+
+
+def _mark_crossed_out_cells(table_element):
+    table_element = BeautifulSoup(
+        str(table_element),
+        "html.parser",
+    ).find("table")
+
+    for element in table_element.find_all(True):
+        style = (element.get("style") or "").lower()
+        tag_is_strike = element.name in ("s", "strike", "del")
+        style_is_strike = "line-through" in style
+
+        if not tag_is_strike and not style_is_strike:
+            continue
+
+        text = element.get_text(" ", strip=True)
+
+        if text:
+            element.string = f"{text} crossed out"
+
+    return table_element
+
+
+def _best_table_dataframe(table_element, previous_columns=None):
+    candidates = []
+
+    manual = _manual_table_dataframe(table_element, previous_columns)
+
+    if manual is not None:
+        candidates.append(manual)
+
+    for header in ([0, 1], 0, None):
         try:
             table = pd.read_html(
                 StringIO(str(table_element)),
-                header=[0, 1],
+                header=header,
             )[0]
         except ValueError:
-            try:
-                table = pd.read_html(
-                    StringIO(str(table_element)),
-                    header=0,
-                )[0]
-            except ValueError as error:
-                print("Skipping table:", error)
-                continue
+            continue
 
-        table = flatten_headers(table)
-        print("Headers:", table.columns.tolist())
+        if isinstance(table.columns, pd.MultiIndex):
+            table = flatten_headers(table)
 
-        table = clean_headers(table)
-        table = make_unique_columns(table)
+        candidates.append(table)
 
-        if is_data_table(table):
-            cleaned.append(table)
+    scored = []
 
-    if not cleaned:
-        raise RuntimeError(
-            "No usable botanical tables found."
+    for candidate in candidates:
+        candidate = _normalize_candidate_table(candidate)
+        score = _table_quality_score(candidate)
+
+        if score > 0:
+            scored.append((score, candidate))
+
+    if not scored:
+        return None
+
+    scored.sort(
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    return scored[0][1]
+
+
+def _normalize_candidate_table(table):
+    table = clean_headers(table)
+    table = coalesce_duplicate_columns(table)
+    table = make_unique_columns(table)
+    table = normalize_botanical_table(table)
+
+    return table
+
+
+def _table_quality_score(table):
+    if not is_data_table(table):
+        return 0
+
+    canonical_columns = sum(
+        column in _identity_column_names() | _data_column_names()
+        for column in table.columns
+    )
+    rows_with_measurements = _rows_with_measurements(table)
+    artifact_rows = _artifact_row_count(table)
+    invalid_values = _invalid_value_count(table)
+    unnamed_columns = sum(str(column).startswith("Unnamed") or str(column) == "" for column in table.columns)
+
+    return (
+        canonical_columns * 20
+        + rows_with_measurements * 5
+        + len(table.index)
+        - artifact_rows * 50
+        - invalid_values * 20
+        - unnamed_columns * 10
+    )
+
+
+def _manual_table_dataframe(table_element, previous_columns=None):
+    grid = _html_table_grid(table_element)
+
+    if not grid:
+        return None
+
+    header_index = _find_header_row_index(grid)
+
+    if header_index is None:
+        return _headerless_table_dataframe(grid, previous_columns)
+
+    header_rows = [grid[header_index]]
+    next_index = header_index + 1
+
+    if next_index < len(grid) and _looks_like_subheader_row(grid[next_index]):
+        header_rows.append(grid[next_index])
+        next_index += 1
+
+    headers = _headers_from_grid_rows(header_rows)
+
+    while next_index < len(grid) and _looks_like_subheader_row(grid[next_index]):
+        next_index += 1
+
+    rows = [
+        _fit_row_to_width(row, len(headers))
+        for row in grid[next_index:]
+        if _row_has_meaningful_value(row)
+    ]
+
+    if not rows:
+        return None
+
+    return pd.DataFrame(rows, columns=headers)
+
+
+def _headerless_table_dataframe(grid, previous_columns):
+    if not previous_columns:
+        return None
+
+    width = len(previous_columns)
+    rows = [
+        _fit_row_to_width(row, width)
+        for row in grid
+        if _row_has_meaningful_value(row)
+    ]
+
+    if not rows:
+        return None
+
+    if not _rows_match_previous_columns(rows, previous_columns):
+        return None
+
+    return pd.DataFrame(rows, columns=previous_columns)
+
+
+def _rows_match_previous_columns(rows, previous_columns):
+    sample_rows = rows[: min(len(rows), 5)]
+    column_positions = {
+        column: index
+        for index, column in enumerate(previous_columns)
+    }
+
+    numeric_identity_columns = [
+        column
+        for column in ("Chamber", "Column", "Subplot", "Count")
+        if column in column_positions
+    ]
+
+    if numeric_identity_columns:
+        numeric_matches = 0
+        possible_matches = 0
+
+        for row in sample_rows:
+            for column in numeric_identity_columns:
+                possible_matches += 1
+                value = row[column_positions[column]]
+
+                if _looks_numeric(value):
+                    numeric_matches += 1
+
+        if possible_matches and numeric_matches / possible_matches < 0.6:
+            return False
+
+    if "Species" in column_positions:
+        species_values = [
+            row[column_positions["Species"]]
+            for row in sample_rows
+            if not _is_blank_cell(row[column_positions["Species"]])
+        ]
+
+        if species_values and not any(_looks_like_species_code(value) for value in species_values):
+            return False
+
+    return True
+
+
+def _looks_numeric(value):
+    if _is_blank_cell(value):
+        return False
+
+    return bool(re.match(r"^\d+(?:\.\d+)?$", str(value).strip()))
+
+
+def _looks_like_species_code(value):
+    if _is_blank_cell(value):
+        return False
+
+    return bool(re.match(r"^[A-Z]{3,6}$", str(value).strip()))
+
+
+def _html_table_grid(table_element):
+    grid = []
+    rowspans = {}
+
+    for row_index, row in enumerate(table_element.find_all("tr")):
+        grid_row = []
+        column_index = 0
+
+        while (row_index, column_index) in rowspans:
+            text, remaining = rowspans.pop((row_index, column_index))
+            grid_row.append(text)
+
+            if remaining > 1:
+                rowspans[(row_index + 1, column_index)] = (text, remaining - 1)
+
+            column_index += 1
+
+        for cell in row.find_all(["th", "td"]):
+            while (row_index, column_index) in rowspans:
+                text, remaining = rowspans.pop((row_index, column_index))
+                grid_row.append(text)
+
+                if remaining > 1:
+                    rowspans[(row_index + 1, column_index)] = (text, remaining - 1)
+
+                column_index += 1
+
+            text = _clean_cell(cell.get_text(" ", strip=True))
+            colspan = int(cell.get("colspan") or 1)
+            rowspan = int(cell.get("rowspan") or 1)
+
+            for offset in range(colspan):
+                grid_row.append(text)
+
+                if rowspan > 1:
+                    rowspans[(row_index + 1, column_index + offset)] = (
+                        text,
+                        rowspan - 1,
+                    )
+
+            column_index += colspan
+
+        grid.append(grid_row)
+
+    width = max((len(row) for row in grid), default=0)
+
+    return [
+        _fit_row_to_width(row, width)
+        for row in grid
+    ]
+
+
+def _find_header_row_index(grid):
+    best_index = None
+    best_score = 0
+
+    for index, row in enumerate(grid[:5]):
+        score = sum(
+            _canonical_header(value) in _identity_column_names() | _data_column_names()
+            for value in row
         )
 
-    return cleaned
+        if score > best_score:
+            best_index = index
+            best_score = score
+
+    if best_score >= 3:
+        return best_index
+
+    return None
+
+
+def _looks_like_subheader_row(row):
+    values = [
+        _header_match_key(value)
+        for value in row
+        if not _is_blank_cell(value)
+    ]
+
+    if not values:
+        return True
+
+    joined = " ".join(values)
+
+    if any(token in joined for token in ("see map", "total", "green", "cm", "mm")):
+        return True
+
+    canonical_hits = sum(
+        _canonical_header(value) in _identity_column_names() | _data_column_names()
+        for value in row
+    )
+
+    return canonical_hits >= 2
+
+
+def _headers_from_grid_rows(header_rows):
+    if len(header_rows) == 2:
+        aligned_headers = _aligned_split_header_rows(
+            header_rows[0],
+            header_rows[1],
+        )
+
+        if aligned_headers:
+            return aligned_headers
+
+    width = max(len(row) for row in header_rows)
+    headers = []
+
+    for column_index in range(width):
+        parts = []
+
+        for row in header_rows:
+            value = row[column_index] if column_index < len(row) else ""
+
+            if _is_blank_cell(value):
+                continue
+
+            if parts and parts[-1] == value:
+                continue
+
+            parts.append(value)
+
+        headers.append(" ".join(parts).strip())
+
+    return headers
+
+
+def _aligned_split_header_rows(top_row, bottom_row):
+    top_values = [
+        _header_match_key(value)
+        for value in top_row
+    ]
+    bottom_values = [
+        _header_match_key(value)
+        for value in bottom_row
+    ]
+
+    if (
+        top_values
+        and bottom_values
+        and top_values[0] == "subplot"
+        and len(bottom_values) > 2
+        and bottom_values[0] in ("col number", "sub col number")
+        and bottom_values[1] in ("row code", "sub code")
+    ):
+        headers = [
+            f"{top_row[0]} {bottom_row[0]}",
+            f"{top_row[0]} {bottom_row[1]}",
+        ]
+
+        for index in range(1, len(top_row)):
+            bottom_index = index + 1
+            bottom_value = bottom_row[bottom_index] if bottom_index < len(bottom_row) else ""
+
+            if _is_blank_cell(bottom_value):
+                headers.append(top_row[index])
+            else:
+                headers.append(f"{top_row[index]} {bottom_value}")
+
+        return headers[: max(len(top_row), len(bottom_row))]
+
+    return None
+
+
+def _fit_row_to_width(row, width):
+    row = list(row)
+
+    if len(row) >= width:
+        return row[:width]
+
+    return row + [""] * (width - len(row))
+
+
+def _row_has_meaningful_value(row):
+    return any(not _is_blank_cell(value) for value in row)
+
+
+def _rows_with_measurements(table):
+    measurement_columns = [
+        column
+        for column in ("Count", "Height_cm", "Total_Height", "Green_Height", "Width_mm", "Width_cm", "Flower")
+        if column in table.columns
+    ]
+
+    if not measurement_columns:
+        return 0
+
+    return int(
+        table[measurement_columns].apply(
+            lambda row: any(not _is_blank_cell(value) for value in row),
+            axis=1,
+        ).sum()
+    )
+
+
+def _artifact_row_count(table):
+    return int(
+        table.apply(
+            lambda row: any(len(str(value)) > 200 for value in row if not _is_blank_cell(value)),
+            axis=1,
+        ).sum()
+    )
+
+
+def _invalid_value_count(table):
+    invalid = 0
+
+    validators = {
+        "Chamber": _looks_numeric,
+        "Column": _looks_numeric,
+        "Subplot": _looks_numeric,
+        "Consec_Number": _looks_numeric,
+        "Height_cm": _looks_numeric_or_dash,
+        "Total_Height": _looks_numeric_or_dash_or_none_found,
+        "Green_Height": _looks_numeric_or_dash,
+        "Width_mm": _looks_numeric_or_dash,
+        "Width_cm": _looks_numeric_or_dash,
+        "Flower": _looks_like_code_cell,
+        "Herbivory": _looks_like_code_cell,
+    }
+
+    for column, validator in validators.items():
+        if column not in table.columns:
+            continue
+
+        for value in table[column]:
+            if _is_blank_cell(value):
+                continue
+
+            if not validator(value):
+                invalid += 1
+
+    return invalid
+
+
+def _looks_numeric_or_dash(value):
+    if _looks_numeric(value):
+        return True
+
+    return str(value).strip() in {"-", "—", "x", "X"}
+
+
+def _looks_numeric_or_dash_or_none_found(value):
+    if _looks_numeric_or_dash(value):
+        return True
+
+    return str(value).strip().lower() == "none found"
+
+
+def _looks_like_code_cell(value):
+    if _is_blank_cell(value):
+        return True
+
+    return bool(re.match(r"^[A-Za-z—xX/-]{1,12}$", str(value).strip()))
 
 
 def flatten_headers(df):
@@ -402,34 +1102,104 @@ def flatten_headers(df):
 
 def clean_headers(df):
     df.columns = [
-        _normalize_header(column)
+        _canonical_header(column)
         for column in df.columns
     ]
 
-    rename = {
-        "Subplot COL #": "Subplot",
-        "Subplot Row Code": "Row_Code",
-        "Consec Number 1, 2, 3... per quad": "Consec_Number",
-        "Height (cm) (cm)": "Height_cm",
-        "Width (mm) (only if > 200 cm)": "Width_mm",
-        "Flower Y/N/C": "Flower",
-        "Herbivory G/L/A/N": "Herbivory",
-        "CEVO Flag #": "CEVO_Flag",
-        "CH": "Chamber",
-        "Col": "Column",
-        "Col (see map)": "Column",
-        "Row": "Row",
-        "Species": "Species",
-        "Count": "Count",
-        "Height Total (cm)": "Total_Height",
-        "Height Green (cm)": "Green_Height",
-        "Total (cm)": "Total_Height",
-        "Green (cm)": "Green_Height",
-        "Width (mm)": "Width_mm",
-        "Width": "Width_mm",
-    }
+    return df
 
-    return df.rename(columns=rename)
+
+CANONICAL_HEADER_PATTERNS = {
+    "Chamber": [
+        "ch",
+        "chamber",
+        "chamber number",
+    ],
+    "Column": [
+        "col",
+        "column",
+        "column see map",
+        "subplot col number",
+    ],
+    "Row": [
+        "row",
+        "subplot row",
+    ],
+    "Subplot": [
+        "subplot",
+        "subplots",
+        "sub",
+        "sub number",
+        "subplot number",
+        "subplots number",
+        "subplot col number",
+        "sub col number",
+    ],
+    "Row_Code": [
+        "code",
+        "sub code",
+        "row code",
+        "subplot code",
+        "subplots code",
+        "subplot sub code",
+        "subplots sub code",
+        "subplot row code",
+    ],
+    "Consec_Number": [
+        "consec number",
+        "consecutive number",
+        "consec number per quad",
+    ],
+    "Species": [
+        "species",
+        "species see list",
+        "plant species",
+    ],
+    "Count": [
+        "count",
+        "stem count",
+    ],
+    "Height_cm": [
+        "height",
+        "height cm",
+    ],
+    "Total_Height": [
+        "total",
+        "total cm",
+        "height total",
+        "height total cm",
+        "total height",
+    ],
+    "Green_Height": [
+        "green",
+        "green cm",
+        "height green",
+        "height green cm",
+        "green height",
+    ],
+    "Width_mm": [
+        "width",
+        "width mm",
+        "width only if greater than 200 cm",
+    ],
+    "Width_cm": [
+        "width cm",
+    ],
+    "Flower": [
+        "flower",
+        "flower y n c",
+        "flower yes no cut",
+    ],
+    "Herbivory": [
+        "herbivory",
+        "herbivory g l a n",
+    ],
+    "CEVO_Flag": [
+        "cevo",
+        "cevo flag",
+        "cevo flag number",
+    ],
+}
 
 
 def _normalize_header(value):
@@ -438,6 +1208,82 @@ def _normalize_header(value):
     value = value.replace(" (", " (")
 
     return value
+
+
+def _canonical_header(value):
+    original = _normalize_header(value)
+    normalized = _header_match_key(original)
+
+    if "consec" in normalized:
+        return "Consec_Number"
+
+    if "cevo" in normalized:
+        return "CEVO_Flag"
+
+    if "code" in normalized:
+        return "Row_Code"
+
+    if "width" in normalized:
+        if "cm" in normalized and "mm" not in normalized:
+            return "Width_cm"
+
+        return "Width_mm"
+
+    best_name = original
+    best_score = 0.0
+
+    for canonical_name, patterns in CANONICAL_HEADER_PATTERNS.items():
+        for pattern in patterns:
+            score = _header_similarity(normalized, _header_match_key(pattern))
+
+            if score > best_score:
+                best_name = canonical_name
+                best_score = score
+
+    if best_score >= 0.78:
+        return best_name
+
+    return original
+
+
+def _header_match_key(value):
+    value = str(value).lower()
+    value = value.replace("#", " number ")
+    value = value.replace("?", " ")
+    value = value.replace(">", " greater than ")
+    value = re.sub(r"\bch\s+\d+\b", "ch", value)
+    value = re.sub(r"\([^)]*see list[^)]*\)", " species ", value)
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    value = re.sub(r"\b(y|n|c|g|l|a)\b", " ", value)
+    value = re.sub(r"\s+", " ", value)
+
+    return value.strip()
+
+
+def _header_similarity(value, pattern):
+    if not value or not pattern:
+        return 0.0
+
+    value_tokens = set(value.split())
+    pattern_tokens = set(pattern.split())
+
+    if value == pattern:
+        return 1.0
+
+    if pattern_tokens and pattern_tokens.issubset(value_tokens):
+        return 0.96
+
+    if value_tokens and value_tokens.issubset(pattern_tokens):
+        return 0.9
+
+    overlap = 0.0
+
+    if value_tokens and pattern_tokens:
+        overlap = len(value_tokens & pattern_tokens) / len(value_tokens | pattern_tokens)
+
+    fuzzy = SequenceMatcher(None, value, pattern).ratio()
+
+    return max(overlap, fuzzy)
 
 
 def make_unique_columns(df):
@@ -460,27 +1306,211 @@ def make_unique_columns(df):
     return df
 
 
+def coalesce_duplicate_columns(df):
+    duplicate_names = [
+        column
+        for column in dict.fromkeys(df.columns)
+        if list(df.columns).count(column) > 1
+    ]
+
+    for column in duplicate_names:
+        same_name = df.loc[:, df.columns == column]
+        coalesced = same_name.bfill(axis=1).iloc[:, 0]
+        df = df.drop(columns=[column])
+        df[column] = coalesced
+
+    return df
+
+
 def is_data_table(df):
-    columns = [
-        str(column).lower()
+    column_set = set(df.columns)
+    identity_columns = {
+        "Chamber",
+        "Column",
+        "Row",
+        "Subplot",
+        "Row_Code",
+        "Consec_Number",
+    }
+    data_columns = {
+        "Species",
+        "Count",
+        "Height_cm",
+        "Total_Height",
+        "Green_Height",
+        "Width_mm",
+        "Flower",
+        "Herbivory",
+        "CEVO_Flag",
+    }
+
+    identity_matches = len(column_set & identity_columns)
+    data_matches = len(column_set & data_columns)
+
+    if "Species" in column_set and data_matches >= 2:
+        return True
+
+    return identity_matches >= 1 and data_matches >= 2
+
+
+def normalize_botanical_table(df):
+    df = _clean_dataframe(df)
+    df = _drop_empty_named_columns(df)
+    df = _drop_artifact_rows(df)
+    df = _drop_full_x_rows(df)
+    df = _fill_down_continuation_cells(df)
+    df = _drop_empty_botanical_rows(df)
+
+    return df.reset_index(drop=True)
+
+
+def _drop_empty_named_columns(df):
+    columns_to_keep = [
+        column
         for column in df.columns
+        if not _is_blank_cell(column)
     ]
 
-    keywords = [
-        "height",
-        "species",
-        "subplot",
-        "count",
-        "flower",
-        "width",
-    ]
+    return df[columns_to_keep]
 
-    matches = sum(
-        any(keyword in column for column in columns)
-        for keyword in keywords
+
+def _drop_artifact_rows(df):
+    artifact_rows = df.apply(
+        _looks_like_artifact_row,
+        axis=1,
     )
 
-    return matches >= 2
+    return df.loc[~artifact_rows]
+
+
+def _drop_full_x_rows(df):
+    x_rows = df.map(_normalize_cell_for_matching).apply(
+        lambda row: (
+            any(value == "x" for value in row)
+            and all(value in ("", "x") for value in row)
+        ),
+        axis=1,
+    )
+
+    return df.loc[~x_rows]
+
+
+def _looks_like_artifact_row(row):
+    values = [
+        str(value).strip()
+        for value in row
+        if not _is_blank_cell(value)
+    ]
+
+    if not values:
+        return False
+
+    if any(len(value) > 120 for value in values):
+        return True
+
+    if any("see map" in value.lower() for value in values):
+        return True
+
+    repeated_long_values = len(values) >= 3 and len(set(values)) <= 2
+    many_tokens = any(len(value.split()) > 20 for value in values)
+
+    return repeated_long_values and many_tokens
+
+
+def _fill_down_continuation_cells(df):
+    fill_columns = [
+        column
+        for column in (
+            "Chamber",
+            "Column",
+            "Row",
+            "Subplot",
+            "Row_Code",
+            "Species",
+        )
+        if column in df.columns
+    ]
+
+    for column in fill_columns:
+        previous = None
+        values = []
+
+        for value in df[column]:
+            if _is_continuation_marker(value):
+                values.append(previous if previous is not None else value)
+                continue
+
+            if not _is_blank_cell(value):
+                previous = value
+
+            values.append(value)
+
+        df[column] = values
+
+    return df
+
+
+def _drop_empty_botanical_rows(df):
+    protected_columns = {
+        "Chamber",
+        "Column",
+        "Row",
+        "Subplot",
+        "Row_Code",
+        "Consec_Number",
+        "Species",
+    }
+    value_columns = [
+        column
+        for column in df.columns
+        if column not in protected_columns
+    ]
+
+    if not value_columns:
+        return df.dropna(how="all")
+
+    has_value = df[value_columns].apply(
+        lambda row: any(not _is_blank_cell(value) for value in row),
+        axis=1,
+    )
+    identity_columns = [
+        column
+        for column in df.columns
+        if column in protected_columns and column != "Species"
+    ]
+
+    if identity_columns:
+        has_identity = df[identity_columns].apply(
+            lambda row: any(not _is_blank_cell(value) for value in row),
+            axis=1,
+        )
+    else:
+        has_identity = pd.Series(False, index=df.index)
+
+    return df.loc[has_value | has_identity]
+
+
+def _is_continuation_marker(value):
+    return str(value).strip().lower() in {
+        "↓",
+        "v",
+        '"',
+        "''",
+        "same",
+        "ditto",
+    }
+
+
+def _is_blank_cell(value):
+    if pd.isna(value):
+        return True
+
+    return str(value).strip().lower() in {
+        "",
+        "nan",
+        "none",
+        "null",
+    }
 
 
 def _dedupe_adjacent(values):
@@ -617,7 +1647,12 @@ def _strip_markdown_emphasis(value):
     return re.sub(r"\*\*(.*?)\*\*", r"\1", value).strip()
 
 
-def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx"):
+def dataframes_to_excel(
+    dataframes,
+    output_dir,
+    output_filename="converted.xlsx",
+    run_metadata=None,
+):
     output_dir = Path(output_dir)
     output_dir.mkdir(
         parents=True,
@@ -633,12 +1668,27 @@ def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx"
     )
     final = remove_crossed_out_rows(final)
 
-    final.to_excel(
-        output_file,
-        index=False,
-        sheet_name="Data",
-        engine="openpyxl",
-    )
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        final.to_excel(
+            writer,
+            index=False,
+            sheet_name="Data",
+        )
+
+        if run_metadata:
+            pd.DataFrame(
+                [
+                    {
+                        "key": key,
+                        "value": value,
+                    }
+                    for key, value in run_metadata.items()
+                ]
+            ).to_excel(
+                writer,
+                index=False,
+                sheet_name="_RunInfo",
+            )
 
     print("Saved:", output_file)
 
@@ -647,15 +1697,14 @@ def dataframes_to_excel(dataframes, output_dir, output_filename="converted.xlsx"
 
 def remove_crossed_out_rows(df):
     df = df.copy()
-    text_df = df.astype(str).apply(lambda column: column.str.strip())
-    lowered_df = text_df.apply(lambda column: column.str.lower())
+    normalized_df = df.map(_normalize_cell_for_matching)
 
-    crossed_out_text = lowered_df.apply(
+    crossed_out_text = normalized_df.apply(
         lambda row: row.str.contains("crossed out", na=False).any(),
         axis=1,
     )
-    large_x_rows = _large_x_placeholder_rows(lowered_df)
-    rows_to_drop = crossed_out_text | large_x_rows
+    x_placeholder_rows = _x_placeholder_rows(normalized_df)
+    rows_to_drop = crossed_out_text | x_placeholder_rows
 
     dropped = int(rows_to_drop.sum())
 
@@ -665,27 +1714,81 @@ def remove_crossed_out_rows(df):
     return df.loc[~rows_to_drop].reset_index(drop=True)
 
 
-def _large_x_placeholder_rows(lowered_df):
-    measurement_columns = [
+def _x_placeholder_rows(normalized_df):
+    field_columns = [
         column
-        for column in ("Total_Height", "Green_Height", "Width_mm", "Flower")
-        if column in lowered_df.columns
+        for column in (
+            "Count",
+            "Height_cm",
+            "Total_Height",
+            "Green_Height",
+            "Width_mm",
+            "Width_cm",
+            "Flower",
+            "Herbivory",
+            "CEVO_Flag",
+        )
+        if column in normalized_df.columns
     ]
 
-    if measurement_columns:
-        return lowered_df[measurement_columns].eq("x").all(axis=1)
+    if not field_columns:
+        field_columns = [
+            column
+            for column in normalized_df.columns
+            if column not in _identity_column_names()
+        ]
 
-    non_identity_columns = [
-        column
-        for column in lowered_df.columns
-        if column not in ("Chamber", "Column", "Row", "Species", "Count")
-    ]
+    if not field_columns:
+        return pd.Series(False, index=normalized_df.index)
 
-    if not non_identity_columns:
-        return pd.Series(False, index=lowered_df.index)
+    field_df = normalized_df[field_columns]
+    has_x = field_df.eq("x").any(axis=1)
+    non_blank_values_are_x = field_df.apply(
+        lambda row: all(value in ("", "x") for value in row),
+        axis=1,
+    )
 
-    return lowered_df[non_identity_columns].eq("x").all(axis=1)
+    return has_x & non_blank_values_are_x
 
+
+def _identity_column_names():
+    return {
+        "Chamber",
+        "Column",
+        "Row",
+        "Subplot",
+        "Row_Code",
+        "Consec_Number",
+        "Species",
+    }
+
+
+def _data_column_names():
+    return {
+        "Count",
+        "Height_cm",
+        "Total_Height",
+        "Green_Height",
+        "Width_mm",
+        "Width_cm",
+        "Flower",
+        "Herbivory",
+        "CEVO_Flag",
+    }
+
+
+def _normalize_cell_for_matching(value):
+    if pd.isna(value):
+        return ""
+
+    value = str(value).strip().lower()
+    value = value.replace("\xa0", " ")
+    value = re.sub(r"\s+", " ", value)
+
+    if value in ("nan", "none", "null"):
+        return ""
+
+    return value
 
 def _clean_dataframe(df):
     df = df.copy()
@@ -714,11 +1817,41 @@ def _clean_cell(value):
     )
 
 
-def convert_pdf_to_excel(pdf_path, output_dir, output_filename="converted.xlsx"):
+def convert_pdf_to_excel(
+    pdf_path,
+    output_dir,
+    output_filename="converted.xlsx",
+    html_output_dir=None,
+):
     pipeline_result = chandra_convert(pdf_path)
+    pdf_path = Path(pdf_path)
+    html_files = []
 
-    return pipeline_result_to_excel(
+    if html_output_dir:
+        html_files = save_intermediate_html_outputs(
+            pipeline_result,
+            html_output_dir,
+            filename_prefix=pdf_path.stem,
+        )
+
+    excel_file = pipeline_result_to_excel(
         pipeline_result,
         output_dir,
         output_filename=output_filename,
+        run_metadata={
+            "source_pdf": pdf_path.name,
+            "output_file": output_filename,
+            "pipeline_id": DATALAB_PIPELINE_ID,
+            "execution_id": (
+                pipeline_result.get("execution") or {}
+            ).get("execution_id"),
+        },
     )
+
+    if html_output_dir:
+        return {
+            "excel_file": excel_file,
+            "html_files": html_files,
+        }
+
+    return excel_file

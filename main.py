@@ -1,4 +1,5 @@
 import uuid
+import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
@@ -58,6 +59,9 @@ async def convert(
         f"{file_id}.pdf"
     )
     output_filename = f"{file_id}.xlsx"
+    html_output_dir = OUTPUT_DIR / f"{file_id}-html"
+    zip_path = OUTPUT_DIR / f"{file_id}.zip"
+    download_filename = f"converted-{file_id}.zip"
 
 
     with open(pdf_path, "wb") as f:
@@ -71,10 +75,11 @@ async def convert(
 
 
     try:
-        excel_file = convert_pdf_to_excel(
+        conversion_result = convert_pdf_to_excel(
             str(pdf_path),
             str(OUTPUT_DIR),
-            output_filename=output_filename
+            output_filename=output_filename,
+            html_output_dir=str(html_output_dir),
         )
     except Exception as error:
         raise HTTPException(
@@ -82,12 +87,23 @@ async def convert(
             detail=str(error)
         ) from error
 
+    excel_file = conversion_result["excel_file"]
+    html_files = conversion_result["html_files"]
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.write(
+            excel_file,
+            arcname="converted.xlsx",
+        )
+
+        for html_file in dict.fromkeys(html_files):
+            archive.write(
+                html_file,
+                arcname=f"intermediate_html/{Path(html_file).name}",
+            )
 
     return FileResponse(
-        excel_file,
-        filename="converted.xlsx",
-        media_type=(
-            "application/vnd.openxmlformats-"
-            "officedocument.spreadsheetml.sheet"
-        )
+        zip_path,
+        filename=download_filename,
+        media_type="application/zip",
     )
