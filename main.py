@@ -15,9 +15,11 @@ app = FastAPI()
 
 UPLOAD_DIR = Path("uploads")
 OUTPUT_DIR = Path("outputs")
+STATIC_DIR = Path("static")
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
+STATIC_DIR.mkdir(exist_ok=True)
 
 
 templates = Jinja2Templates(
@@ -27,7 +29,7 @@ templates = Jinja2Templates(
 
 app.mount(
     "/static",
-    StaticFiles(directory="static"),
+    StaticFiles(directory=STATIC_DIR),
     name="static"
 )
 
@@ -35,10 +37,8 @@ app.mount(
 @app.get("/")
 async def home(request: Request):
     return templates.TemplateResponse(
+        request,
         "index.html",
-        {
-            "request": request
-        }
     )
 
 
@@ -82,9 +82,10 @@ async def convert(
             html_output_dir=str(html_output_dir),
         )
     except Exception as error:
+        print("Conversion failed:", error)
         raise HTTPException(
             status_code=502,
-            detail=str(error)
+            detail=f"Conversion failed: {error}"
         ) from error
 
     excel_file = conversion_result["excel_file"]
