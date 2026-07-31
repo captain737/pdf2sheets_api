@@ -190,6 +190,7 @@ def pipeline_result_to_excel(
     output_dir,
     output_filename="converted.xlsx",
     run_metadata=None,
+    sheet_name=None,
 ):
     dataframes = _extract_dataframes_from_pipeline_result(pipeline_result)
     return dataframes_to_excel(
@@ -197,6 +198,7 @@ def pipeline_result_to_excel(
         output_dir,
         output_filename,
         run_metadata=run_metadata,
+        sheet_name=sheet_name,
     )
 
 
@@ -1656,6 +1658,7 @@ def dataframes_to_excel(
     output_dir,
     output_filename="converted.xlsx",
     run_metadata=None,
+    sheet_name=None,
 ):
     output_dir = Path(output_dir)
     output_dir.mkdir(
@@ -1676,7 +1679,7 @@ def dataframes_to_excel(
         final.to_excel(
             writer,
             index=False,
-            sheet_name="Data",
+            sheet_name=_excel_sheet_name(sheet_name or Path(output_filename).stem),
         )
 
         if run_metadata:
@@ -1697,6 +1700,14 @@ def dataframes_to_excel(
     print("Saved:", output_file)
 
     return str(output_file)
+
+
+def _excel_sheet_name(value):
+    sheet_name = re.sub(r"[\[\]:*?/\\]", "_", str(value)).strip("'").strip()
+    if not sheet_name:
+        return "Sheet1"
+
+    return sheet_name[:31]
 
 
 def remove_crossed_out_rows(df):
@@ -1842,6 +1853,7 @@ def convert_pdf_to_excel(
         pipeline_result,
         output_dir,
         output_filename=output_filename,
+        sheet_name=pdf_path.stem,
         run_metadata={
             "source_pdf": pdf_path.name,
             "output_file": output_filename,

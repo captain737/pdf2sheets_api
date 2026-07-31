@@ -52,16 +52,17 @@ async def convert(
             detail="Upload must be a PDF file."
         )
 
-    file_id = str(uuid.uuid4())
+    input_filename = Path(file.filename or f"{uuid.uuid4()}.pdf").name
+    input_file_stem = Path(input_filename).stem
 
     pdf_path = (
         UPLOAD_DIR /
-        f"{file_id}.pdf"
+        input_filename
     )
-    output_filename = f"{file_id}.xlsx"
-    html_output_dir = OUTPUT_DIR / f"{file_id}-html"
-    zip_path = OUTPUT_DIR / f"{file_id}.zip"
-    download_filename = f"converted-{file_id}.zip"
+    output_filename = f"{input_file_stem}.xlsx"
+    html_output_dir = OUTPUT_DIR / input_file_stem
+    zip_path = OUTPUT_DIR / f"{input_file_stem}.zip"
+    download_filename = f"{input_file_stem}.zip"
 
 
     with open(pdf_path, "wb") as f:
@@ -94,13 +95,13 @@ async def convert(
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.write(
             excel_file,
-            arcname="converted.xlsx",
+            arcname=output_filename,
         )
 
         for html_file in dict.fromkeys(html_files):
             archive.write(
                 html_file,
-                arcname=f"intermediate_html/{Path(html_file).name}",
+                arcname=f"{input_file_stem}/{Path(html_file).name}",
             )
 
     return FileResponse(
